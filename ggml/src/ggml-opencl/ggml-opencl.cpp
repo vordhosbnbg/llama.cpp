@@ -390,7 +390,9 @@ struct ggml_backend_opencl_context {
     ADRENO_GPU_GEN adreno_gen;
 
     cl_int alignment;
+    size_t global_mem_size;
     size_t max_alloc_size;
+    size_t allocated_size;
     size_t max_workgroup_size;
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
@@ -3434,6 +3436,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->adreno_has_large_buffer = false;
     backend_ctx->adreno_use_large_buffer = false;
     backend_ctx->adreno_wave_size = 0;
+    backend_ctx->global_mem_size = 0;
+    backend_ctx->allocated_size = 0;
     backend_ctx->non_uniform_workgroups = false;
     backend_ctx->image_max_buffer_size = 0;
     backend_ctx->legacy_probe_only = false;
@@ -3530,6 +3534,11 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         backend_ctx->alignment = base_align_in_bits / 8u;
         GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n", backend_ctx->alignment);
 
+        cl_ulong global_mem_size;
+        clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &global_mem_size, NULL);
+        backend_ctx->global_mem_size = (size_t) global_mem_size;
+        GGML_LOG_INFO("ggml_opencl: global mem size: %zu MB\n", backend_ctx->global_mem_size/1024/1024);
+
         clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL);
         GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n", backend_ctx->max_alloc_size/1024/1024);
 
@@ -3575,6 +3584,11 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     GGML_ASSERT(base_align_in_bits % 8u == 0);
     backend_ctx->alignment = base_align_in_bits / 8u;
     GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n", backend_ctx->alignment);
+
+    cl_ulong global_mem_size;
+    clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &global_mem_size, NULL);
+    backend_ctx->global_mem_size = (size_t) global_mem_size;
+    GGML_LOG_INFO("ggml_opencl: global mem size: %zu MB\n", backend_ctx->global_mem_size/1024/1024);
 
     clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL);
     GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n", backend_ctx->max_alloc_size/1024/1024);
@@ -4372,6 +4386,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     return GGML_STATUS_SUCCESS;
 }
 
+static bool ggml_opencl_is_fermi_debug_tensor(const ggml_tensor * tensor) {
+    return tensor != nullptr && strcmp(tensor->name, "output.weight") == 0;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -4393,17 +4411,44 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             case GGML_OP_TRANSPOSE:
                 return true;
             case GGML_OP_MUL_MAT:
-                return op->src[0]->type == GGML_TYPE_Q4_0 &&
-                       op->src[1]->type == GGML_TYPE_F32 &&
-                       op->type == GGML_TYPE_F32 &&
-                       op->src[0]->ne[0] % 32 == 0 &&
-                       op->src[1]->ne[2] % op->src[0]->ne[2] == 0 &&
-                       op->src[1]->ne[3] % op->src[0]->ne[3] == 0 &&
-                       op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
-                       op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
-                       op->nb[0] == ggml_type_size(op->type) &&
-                       backend_ctx->legacy_half_storage_support &&
-                       backend_ctx->kernel_legacy_mul_mat_q4_0_f32 != nullptr;
+                {
+                    const bool src0_q4_0       = op->src[0]->type == GGML_TYPE_Q4_0;
+                    const bool src1_f32        = op->src[1]->type == GGML_TYPE_F32;
+                    const bool dst_f32         = op->type == GGML_TYPE_F32;
+                    const bool src0_block_ok   = op->src[0]->ne[0] % 32 == 0;
+                    const bool src1_ne2_ok     = op->src[1]->ne[2] % op->src[0]->ne[2] == 0;
+                    const bool src1_ne3_ok     = op->src[1]->ne[3] % op->src[0]->ne[3] == 0;
+                    const bool src0_nb0_ok     = op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
+                    const bool src1_nb0_ok     = op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
+                    const bool dst_nb0_ok      = op->nb[0] == ggml_type_size(op->type);
+                    const bool half_storage_ok = backend_ctx->legacy_half_storage_support;
+                    const bool kernel_ok       = backend_ctx->kernel_legacy_mul_mat_q4_0_f32 != nullptr;
+                    const bool supported       = src0_q4_0 && src1_f32 && dst_f32 && src0_block_ok &&
+                                                 src1_ne2_ok && src1_ne3_ok && src0_nb0_ok &&
+                                                 src1_nb0_ok && dst_nb0_ok && half_storage_ok && kernel_ok;
+
+                    if (!supported && ggml_opencl_is_fermi_debug_tensor(op->src[0])) {
+                        GGML_LOG_INFO(
+                            "ggml_opencl: legacy NVIDIA rejects output.weight MUL_MAT: src0_q4_0=%s src1_f32=%s dst_f32=%s src0_block_ok=%s src1_ne2_ok=%s src1_ne3_ok=%s src0_nb0_ok=%s src1_nb0_ok=%s dst_nb0_ok=%s half_storage_ok=%s kernel_ok=%s src0_ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src1_ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] dst_ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src0_nb0=%zu src1_nb0=%zu dst_nb0=%zu\n",
+                            src0_q4_0 ? "true" : "false",
+                            src1_f32 ? "true" : "false",
+                            dst_f32 ? "true" : "false",
+                            src0_block_ok ? "true" : "false",
+                            src1_ne2_ok ? "true" : "false",
+                            src1_ne3_ok ? "true" : "false",
+                            src0_nb0_ok ? "true" : "false",
+                            src1_nb0_ok ? "true" : "false",
+                            dst_nb0_ok ? "true" : "false",
+                            half_storage_ok ? "true" : "false",
+                            kernel_ok ? "true" : "false",
+                            op->src[0]->ne[0], op->src[0]->ne[1], op->src[0]->ne[2], op->src[0]->ne[3],
+                            op->src[1]->ne[0], op->src[1]->ne[1], op->src[1]->ne[2], op->src[1]->ne[3],
+                            op->ne[0], op->ne[1], op->ne[2], op->ne[3],
+                            op->src[0]->nb[0], op->src[1]->nb[0], op->nb[0]);
+                    }
+
+                    return supported;
+                }
             default:
                 return false;
         }
@@ -5029,6 +5074,11 @@ struct ggml_backend_opencl_buffer_context {
 };
 
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+    if (backend_ctx != nullptr) {
+        backend_ctx->allocated_size = buffer->size <= backend_ctx->allocated_size ? backend_ctx->allocated_size - buffer->size : 0;
+    }
+
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
     delete ctx;
 }
@@ -6785,6 +6835,8 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
         return nullptr;
     }
 
+    backend_ctx->allocated_size += size;
+
     ggml_backend_opencl_buffer_context * ctx = new ggml_backend_opencl_buffer_context(mem);
 
     return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
@@ -6835,11 +6887,16 @@ static const char * ggml_backend_opencl_device_get_description(ggml_backend_dev_
 }
 
 static void ggml_backend_opencl_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    // no memory to report
-    *free  = 0;
-    *total = 0;
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(dev);
+    if (backend_ctx == nullptr) {
+        *free  = 0;
+        *total = 0;
+        return;
+    }
 
-    GGML_UNUSED(dev);
+    *total = backend_ctx->global_mem_size;
+    *free  = backend_ctx->global_mem_size > backend_ctx->allocated_size ?
+             backend_ctx->global_mem_size - backend_ctx->allocated_size : 0;
 }
 
 static enum ggml_backend_dev_type ggml_backend_opencl_device_get_type(ggml_backend_dev_t dev) {

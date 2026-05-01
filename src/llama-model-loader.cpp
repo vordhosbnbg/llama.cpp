@@ -889,6 +889,10 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
     return cur;
 }
 
+static bool llama_fermi_debug_tensor(const ggml_tensor * tensor) {
+    return tensor != nullptr && strcmp(tensor->name, "output.weight") == 0;
+}
+
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
@@ -1031,10 +1035,29 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
+    const bool fermi_debug = llama_fermi_debug_tensor(tensor);
+
+    if (fermi_debug) {
+        LLAMA_LOG_INFO(
+            "llama_model_loader: fermi offload probe tensor=%s op=%s type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] candidates=%zu preferred=%s\n",
+            tensor->name, ggml_op_name(op), ggml_type_name(tensor->type),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+            buft_list->size(), ggml_backend_buft_name(buft_list->front().second));
+    }
+
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
-        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+        const bool supported = weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev);
+
+        if (fermi_debug) {
+            LLAMA_LOG_INFO(
+                "llama_model_loader: fermi offload candidate tensor=%s dev=%s buft=%s supported=%s\n",
+                tensor->name, ggml_backend_dev_name(cur_dev), ggml_backend_buft_name(cur_buft),
+                supported ? "true" : "false");
+        }
+
+        if (supported) {
             return cur_buft;
         }
     }
@@ -1185,6 +1208,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+        }
+
+        if (llama_fermi_debug_tensor(t_meta)) {
+            LLAMA_LOG_INFO(
+                "llama_model_loader: fermi offload selected tensor=%s layer=%d op=%s preferred=%s selected=%s\n",
+                t_meta->name, (int) info.layer, ggml_op_name(op),
+                ggml_backend_buft_name(buft_list->front().second), ggml_backend_buft_name(buft));
         }
 
         // avoid using a host buffer when using mmap
