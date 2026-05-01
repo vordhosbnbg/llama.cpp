@@ -87,6 +87,7 @@ static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
 enum GPU_FAMILY {
     ADRENO,
     INTEL,
+    NVIDIA_LEGACY,
     UNKNOWN,
 };
 
@@ -403,6 +404,8 @@ struct ggml_backend_opencl_context {
 
     cl_bool non_uniform_workgroups;
     size_t  image_max_buffer_size;
+    bool legacy_probe_only;
+    bool legacy_half_storage_support;
 
     cl_context context;
     cl_command_queue queue;
@@ -477,6 +480,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mm_f32_f32_l4_lm;
     cl_program program_mul_mm_f16_f32_l4_lm;
     cl_program program_mul_mm_q8_0_f32_l4_lm;
+    cl_program program_legacy_mul_mat_q4_0_f32;
 
     cl_kernel kernel_add, kernel_add_row, kernel_add_f16, kernel_add_row_f16;
     cl_kernel kernel_mul, kernel_mul_row, kernel_mul_f16, kernel_mul_row_f16;
@@ -600,6 +604,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q5_k_f32_l4_lm;
     cl_kernel kernel_mul_mm_q6_k_f32_l4_lm;
     cl_kernel kernel_mul_mm_iq4_nl_f32_l4_lm;
+    cl_kernel kernel_legacy_mul_mat_q4_0_f32;
 
     std::vector<ProfilingInfo> profiling_info;
 
@@ -798,6 +803,196 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     }
 
     return p;
+}
+
+static bool try_build_probe_program(
+        cl_context         ctx,
+        cl_device_id       dev,
+        const char *       probe_name,
+        const char *       program_buffer,
+        const std::string &compile_opts,
+        bool               required) {
+    cl_int err;
+    size_t program_size = strlen(program_buffer);
+
+    cl_program program = clCreateProgramWithSource(ctx, 1, &program_buffer, &program_size, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("ggml_opencl: legacy probe '%s' failed to create program: %d\n", probe_name, err);
+        return false;
+    }
+
+    err = clBuildProgram(program, 1, &dev, compile_opts.c_str(), NULL, NULL);
+    if (err != CL_SUCCESS) {
+        size_t log_size = 0;
+        clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+
+        std::string program_log(log_size + 1, '\0');
+        if (log_size > 0) {
+            clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, log_size, &program_log[0], NULL);
+        }
+
+        if (required) {
+            GGML_LOG_ERROR("ggml_opencl: legacy probe '%s' kernel compile error:\n\n%s\n",
+                probe_name, program_log.c_str());
+        } else {
+            GGML_LOG_WARN("ggml_opencl: legacy probe '%s' kernel compile warning:\n\n%s\n",
+                probe_name, program_log.c_str());
+        }
+
+        CL_CHECK(clReleaseProgram(program));
+        return false;
+    }
+
+    CL_CHECK(clReleaseProgram(program));
+    return true;
+}
+
+static bool run_legacy_nvidia_probe(ggml_backend_opencl_context * backend_ctx, ggml_cl_version opencl_c_version) {
+    GGML_ASSERT(backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY);
+
+    std::string opencl_c_std =
+        std::string("CL") + std::to_string(opencl_c_version.major) + "." + std::to_string(opencl_c_version.minor);
+    std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
+                               " -cl-mad-enable -cl-unsafe-math-optimizations"
+                               " -cl-finite-math-only -cl-fast-relaxed-math";
+
+    static const char * basic_probe = R"CLC(
+__kernel void ggml_legacy_basic(__global float * dst) {
+    const uint i = get_global_id(0);
+    dst[i] = (float)i;
+}
+)CLC";
+
+    if (!try_build_probe_program(backend_ctx->context, backend_ctx->device,
+            "basic-opencl-c", basic_probe, compile_opts, true)) {
+        return false;
+    }
+
+    static const char * half_storage_probe = R"CLC(
+struct block_q4_0_probe {
+    half  d;
+    uchar qs[16];
+};
+
+__kernel void ggml_legacy_half_storage(
+        __global const struct block_q4_0_probe * src,
+        __global float * dst) {
+    dst[0] = vload_half(0, &src[0].d);
+}
+)CLC";
+
+    backend_ctx->legacy_half_storage_support =
+        try_build_probe_program(backend_ctx->context, backend_ctx->device,
+            "q4_0-half-storage", half_storage_probe, compile_opts, false);
+
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA basic OpenCL C probe: true\n");
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA q4_0 half-storage probe: %s\n",
+        backend_ctx->legacy_half_storage_support ? "true" : "false");
+
+    if (!backend_ctx->legacy_half_storage_support) {
+        GGML_LOG_ERROR("ggml_opencl: legacy NVIDIA Q4_0 kernel requires half storage support\n");
+        return false;
+    }
+
+    static const char * q4_0_kernel = R"CLC(
+#define QK4_0 32
+
+typedef uchar uint8_t;
+
+struct __attribute__((packed)) block_q4_0 {
+    half d;
+    uint8_t qs[QK4_0 / 2];
+};
+
+__kernel void ggml_legacy_mul_mat_q4_0_f32(
+        __global const void * src0,
+        ulong offset0,
+        __global const float * src1,
+        ulong offset1,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne11,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        __local float * tmp) {
+    const int row = get_group_id(0);
+    const int col = get_group_id(1);
+    const int im  = get_group_id(2);
+    const int tid = get_local_id(0);
+    const int local_size = get_local_size(0);
+
+    const int i12 = im % ne12;
+    const int i13 = im / ne12;
+    const int nb = ne00 / QK4_0;
+
+    __global const struct block_q4_0 * x = (__global const struct block_q4_0 *)(
+        (__global const char *)src0 + offset0 +
+        (ulong)row * nb01 + (ulong)(i12 / r2) * nb02 + (ulong)(i13 / r3) * nb03);
+
+    __global const char * y = (__global const char *)src1 + offset1 +
+        (ulong)col * nb11 + (ulong)i12 * nb12 + (ulong)i13 * nb13;
+
+    float sum = 0.0f;
+    for (int ib = tid; ib < nb; ib += local_size) {
+        const float d = vload_half(0, &x[ib].d);
+        __global const uint8_t * qs = x[ib].qs;
+        const int y_base = ib * QK4_0;
+
+        for (int i = 0; i < QK4_0 / 2; ++i) {
+            const uint8_t q = qs[i];
+            const float x0 = ((int)(q & 0x0F) - 8) * d;
+            const float x1 = ((int)(q >> 4)   - 8) * d;
+            const float y0 = *(__global const float *)(y + (ulong)(y_base + i) * nb10);
+            const float y1 = *(__global const float *)(y + (ulong)(y_base + i + QK4_0 / 2) * nb10);
+            sum += x0 * y0 + x1 * y1;
+        }
+    }
+
+    tmp[tid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            tmp[tid] += tmp[tid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid == 0) {
+        __global char * out = (__global char *)dst + offsetd +
+            (ulong)row * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+        *(__global float *)out = tmp[0];
+    }
+}
+)CLC";
+
+    backend_ctx->program_legacy_mul_mat_q4_0_f32 =
+        build_program_from_source(backend_ctx->context, backend_ctx->device, q4_0_kernel, compile_opts);
+
+    cl_int err;
+    CL_CHECK((backend_ctx->kernel_legacy_mul_mat_q4_0_f32 =
+        clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32, "ggml_legacy_mul_mat_q4_0_f32", &err), err));
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 matmul kernel: true\n");
+
+    return true;
 }
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_version opencl_c_version) {
@@ -3201,6 +3396,17 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     auto backend_ctx        = std::make_unique<ggml_backend_opencl_context>();
     backend_ctx->device     = dev_ctx->device;
     backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
+    backend_ctx->adreno_gen = ADRENO_GPU_GEN::ADRENO_UNKNOWN;
+    backend_ctx->fp16_support = false;
+    backend_ctx->has_vector_subgroup_broadcast = false;
+    backend_ctx->disable_fusion = false;
+    backend_ctx->adreno_has_large_buffer = false;
+    backend_ctx->adreno_use_large_buffer = false;
+    backend_ctx->adreno_wave_size = 0;
+    backend_ctx->non_uniform_workgroups = false;
+    backend_ctx->image_max_buffer_size = 0;
+    backend_ctx->legacy_probe_only = false;
+    backend_ctx->legacy_half_storage_support = false;
 
     // ref_count get increased in ggml_backend_opencl_device_init
     // This function is also used to retrieve backend context, so we don't want
@@ -3222,6 +3428,11 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         backend_ctx->adreno_wave_size = 64;
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
         backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+    } else if (strstr(dev_ctx->platform_name.c_str(), "NVIDIA") ||
+               strstr(dev_ctx->device_name.c_str(), "GeForce") ||
+               strstr(dev_ctx->device_version.c_str(), "CUDA")) {
+        backend_ctx->gpu_family = GPU_FAMILY::NVIDIA_LEGACY;
+        backend_ctx->legacy_probe_only = true;
     } else {
         GGML_LOG_ERROR("Unsupported GPU: %s\n", dev_ctx->device_name.c_str());
         backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
@@ -3244,9 +3455,10 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
     ggml_cl_version platform_version = get_opencl_platform_version(dev_ctx->platform);
 
-    // Check device OpenCL version, OpenCL 2.0 or above is required
+    // The regular Intel/Adreno backend requires OpenCL 2.0 or above. Legacy
+    // NVIDIA devices use a probe-only OpenCL 1.1 path below.
     ggml_cl_version opencl_c_version = get_opencl_c_version(platform_version, device);
-    if (opencl_c_version.major < 2) {
+    if (opencl_c_version.major < 2 && backend_ctx->gpu_family != GPU_FAMILY::NVIDIA_LEGACY) {
         GGML_LOG_ERROR("ggml_opencl: OpenCL 2.0 or above is required\n");
         return nullptr;
     }
@@ -3277,6 +3489,40 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     GGML_LOG_INFO("ggml_opencl: device FP16 support: %s\n", backend_ctx->fp16_support ? "true" : "false");
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        GGML_LOG_WARN("ggml_opencl: NVIDIA legacy mode enabled; only Q4_0 x F32 matmul is supported\n");
+
+        cl_uint base_align_in_bits;
+        CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
+        GGML_ASSERT(base_align_in_bits % 8u == 0);
+        backend_ctx->alignment = base_align_in_bits / 8u;
+        GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n", backend_ctx->alignment);
+
+        clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL);
+        GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n", backend_ctx->max_alloc_size/1024/1024);
+
+        clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &backend_ctx->max_workgroup_size, NULL);
+        GGML_LOG_INFO("ggml_opencl: device max workgroup size: %lu\n", backend_ctx->max_workgroup_size);
+
+        cl_int err;
+        cl_command_queue_properties command_queue_props = 0;
+#ifdef GGML_OPENCL_PROFILING
+        command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
+#endif
+        CL_CHECK((backend_ctx->queue = clCreateCommandQueue(dev_ctx->context, device, command_queue_props, &err), err));
+
+        backend_ctx->context = dev_ctx->context;
+        backend_ctx->disable_fusion = true;
+
+        if (!run_legacy_nvidia_probe(backend_ctx.get(), opencl_c_version)) {
+            return nullptr;
+        }
+
+        backend_ctx->legacy_probe_only = false;
+        dev_ctx->backend_ctx = backend_ctx.release();
+        return dev_ctx->backend_ctx;
+    }
 
     // fp16 is required
     if (!backend_ctx->fp16_support) {
@@ -6456,6 +6702,11 @@ static void ggml_backend_opencl_device_get_memory(ggml_backend_dev_t dev, size_t
 }
 
 static enum ggml_backend_dev_type ggml_backend_opencl_device_get_type(ggml_backend_dev_t dev) {
+    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) dev->context;
+    if (dev_ctx->backend_ctx != nullptr && dev_ctx->backend_ctx->legacy_probe_only) {
+        return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    }
+
     return GGML_BACKEND_DEVICE_TYPE_GPU;
 
     GGML_UNUSED(dev);
