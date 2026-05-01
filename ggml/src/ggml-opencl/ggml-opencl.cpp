@@ -750,6 +750,11 @@ struct ggml_backend_opencl_context {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     void free() {
+        if (ref_count <= 0) {
+            GGML_LOG_WARN("ggml_opencl: backend context free called with ref_count=%d\n", ref_count);
+            return;
+        }
+
         ref_count--;
         if (ref_count == 0) {
 #ifdef GGML_OPENCL_PROFILING
@@ -762,6 +767,32 @@ struct ggml_backend_opencl_context {
 
 // All registered devices with a default device in the front.
 static std::vector<ggml_backend_device> g_ggml_backend_opencl_devices;
+
+static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context * ctx) {
+    if (ctx->gpu_family != GPU_FAMILY::NVIDIA_LEGACY) {
+        return;
+    }
+
+    if (ctx->queue != nullptr) {
+        clFinish(ctx->queue);
+    }
+
+    if (ctx->kernel_legacy_mul_mat_q4_0_f32 != nullptr) {
+        cl_int err = clReleaseKernel(ctx->kernel_legacy_mul_mat_q4_0_f32);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 kernel: %d\n", err);
+        }
+        ctx->kernel_legacy_mul_mat_q4_0_f32 = nullptr;
+    }
+
+    if (ctx->program_legacy_mul_mat_q4_0_f32 != nullptr) {
+        cl_int err = clReleaseProgram(ctx->program_legacy_mul_mat_q4_0_f32);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 program: %d\n", err);
+        }
+        ctx->program_legacy_mul_mat_q4_0_f32 = nullptr;
+    }
+}
 
 inline std::string read_file(const std::string &path) {
   std::ifstream ifs(path);
@@ -3655,20 +3686,54 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
 static void ggml_cl2_free(ggml_backend_t backend) {
     ggml_backend_opencl_context * ctx = (ggml_backend_opencl_context *) backend->context;
+
+    if (ctx == nullptr) {
+        return;
+    }
+
     ctx->free();
 
     // The CL context is shared by all backends, release it if all backends have been released
     bool should_release_opencl = true;
     for (auto device : g_ggml_backend_opencl_devices) {
         ggml_backend_opencl_device_context * ctx_dev = (ggml_backend_opencl_device_context *) device.context;
-        if (ctx_dev->backend_ctx->ref_count > 0) {
+        if (ctx_dev->backend_ctx != nullptr && ctx_dev->backend_ctx->ref_count > 0) {
             should_release_opencl = false;
         }
     }
 
-    if (should_release_opencl) {
-        CL_CHECK(clReleaseContext(ctx->context));
+    if (should_release_opencl && ctx->context != nullptr) {
+        for (ggml_backend_device & device : g_ggml_backend_opencl_devices) {
+            ggml_backend_opencl_device_context * ctx_dev = (ggml_backend_opencl_device_context *) device.context;
+            if (ctx_dev->backend_ctx == nullptr) {
+                continue;
+            }
+
+            ggml_cl_release_legacy_nvidia_resources(ctx_dev->backend_ctx);
+
+            if (ctx_dev->backend_ctx->queue != nullptr) {
+                cl_int err = clReleaseCommandQueue(ctx_dev->backend_ctx->queue);
+                if (err != CL_SUCCESS) {
+                    GGML_LOG_WARN("ggml_opencl: failed to release command queue: %d\n", err);
+                }
+                ctx_dev->backend_ctx->queue = nullptr;
+            }
+        }
+
+        cl_int err = clReleaseContext(ctx->context);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release OpenCL context during shutdown: %d\n", err);
+        }
+
+        for (ggml_backend_device & device : g_ggml_backend_opencl_devices) {
+            ggml_backend_opencl_device_context * ctx_dev = (ggml_backend_opencl_device_context *) device.context;
+            if (ctx_dev->backend_ctx != nullptr) {
+                ctx_dev->backend_ctx->context = nullptr;
+            }
+        }
     }
+
+    backend->context = nullptr;
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -4141,6 +4206,18 @@ static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const g
 
 static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+
+    if (backend_ctx == nullptr || backend_ctx->queue == nullptr) {
+        return;
+    }
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        cl_int err = clFinish(backend_ctx->queue);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: legacy NVIDIA clFinish failed during synchronize: %d\n", err);
+        }
+        return;
+    }
 
     cl_event evt;
     CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
