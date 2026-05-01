@@ -4376,6 +4376,39 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
 
+    if (backend_ctx == nullptr) {
+        return op->op == GGML_OP_NONE;
+    }
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        if (backend_ctx->legacy_probe_only) {
+            return op->op == GGML_OP_NONE;
+        }
+
+        switch (op->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                return true;
+            case GGML_OP_MUL_MAT:
+                return op->src[0]->type == GGML_TYPE_Q4_0 &&
+                       op->src[1]->type == GGML_TYPE_F32 &&
+                       op->type == GGML_TYPE_F32 &&
+                       op->src[0]->ne[0] % 32 == 0 &&
+                       op->src[1]->ne[2] % op->src[0]->ne[2] == 0 &&
+                       op->src[1]->ne[3] % op->src[0]->ne[3] == 0 &&
+                       op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                       op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                       op->nb[0] == ggml_type_size(op->type) &&
+                       backend_ctx->legacy_half_storage_support &&
+                       backend_ctx->kernel_legacy_mul_mat_q4_0_f32 != nullptr;
+            default:
+                return false;
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
@@ -5080,6 +5113,18 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
     cl_context context = backend_ctx->context;
     cl_command_queue queue = backend_ctx->queue;
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+        GGML_ASSERT(extra);
+
+        CL_CHECK(clEnqueueWriteBuffer(
+            queue, extra->data_device, CL_TRUE, extra->offset + offset,
+            size, data, 0, NULL, NULL));
+
+        GGML_UNUSED(buffer);
+        return;
+    }
 
 #ifdef GGML_OPENCL_SOA_Q
     // We separate the quantized bits and scale from block_q4_0 by using an
@@ -6033,6 +6078,19 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     // Make sure all previously submitted commands in other devices are finished.
     sync_with_other_backends(backend_ctx);
 
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+        GGML_ASSERT(extra);
+
+        CL_CHECK(clEnqueueReadBuffer(
+            queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
+            size, data, 0, NULL, NULL));
+
+        GGML_UNUSED(context);
+        GGML_UNUSED(buffer);
+        return;
+    }
+
 #ifdef GGML_OPENCL_SOA_Q
     // In end-to-end runs, get_tensor is usually used to get back the logits,
     // where we can simply do clEnqueueReadBuffer since they are f32.
@@ -6708,6 +6766,10 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
 
     // clCreateBuffer returns -61 for size 0
     size = std::max(size, (size_t)1);
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY && size >= 1024*1024) {
+        GGML_LOG_INFO("ggml_opencl: legacy NVIDIA allocating %.2f MiB OpenCL buffer\n", size / 1024.0 / 1024.0);
+    }
 
     cl_int err;
     cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
@@ -11471,10 +11533,71 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const int  ne0 = dst ? dst->ne[0] : 0;
     const int  ne1 = dst ? dst->ne[1] : 0;
 
+    const cl_ulong nb0 = dst ? dst->nb[0] : 0;
+    const cl_ulong nb1 = dst ? dst->nb[1] : 0;
+    const cl_ulong nb2 = dst ? dst->nb[2] : 0;
+    const cl_ulong nb3 = dst ? dst->nb[3] : 0;
+
     int r2 = ne12/ne02;
     int r3 = ne13/ne03;
 
     GGML_ASSERT(ne00 == ne10);
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        GGML_ASSERT(src0t == GGML_TYPE_Q4_0);
+        GGML_ASSERT(src1t == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne00 % 32 == 0);
+        GGML_ASSERT(ne12 % ne02 == 0);
+        GGML_ASSERT(ne13 % ne03 == 0);
+        GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+        GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+        GGML_ASSERT(nb0 == ggml_type_size(dst->type));
+
+        cl_kernel legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32;
+        GGML_ASSERT(legacy_kernel != nullptr);
+
+        const size_t local_size = 128;
+
+        CL_CHECK(clSetKernelArg(legacy_kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  5, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  6, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  7, sizeof(int),      &ne01));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  8, sizeof(int),      &ne02));
+        CL_CHECK(clSetKernelArg(legacy_kernel,  9, sizeof(int),      &ne10));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 10, sizeof(int),      &ne11));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 11, sizeof(int),      &ne12));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 12, sizeof(int),      &ne0));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 13, sizeof(int),      &ne1));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 14, sizeof(int),      &r2));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 15, sizeof(int),      &r3));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 16, sizeof(cl_ulong), &nb01));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 17, sizeof(cl_ulong), &nb02));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 18, sizeof(cl_ulong), &nb03));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 19, sizeof(cl_ulong), &nb10));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 20, sizeof(cl_ulong), &nb11));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 21, sizeof(cl_ulong), &nb12));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 22, sizeof(cl_ulong), &nb13));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 23, sizeof(cl_ulong), &nb0));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 24, sizeof(cl_ulong), &nb1));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 25, sizeof(cl_ulong), &nb2));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 26, sizeof(cl_ulong), &nb3));
+        CL_CHECK(clSetKernelArg(legacy_kernel, 27, sizeof(float) * local_size, NULL));
+
+        size_t global_work_size[] = {
+            (size_t)ne01 * local_size,
+            (size_t)ne11,
+            (size_t)ne12 * ne13,
+        };
+        size_t local_work_size[] = {local_size, 1, 1};
+
+        backend_ctx->enqueue_ndrange_kernel(legacy_kernel, 3, global_work_size, local_work_size, dst);
+        return;
+    }
 
     int nth0 = 32;
     int nth1 = 1;
