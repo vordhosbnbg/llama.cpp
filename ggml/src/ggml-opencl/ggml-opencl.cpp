@@ -665,6 +665,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mm_f16_f32_l4_lm;
     cl_program program_mul_mm_q8_0_f32_l4_lm;
     cl_program program_legacy_mul_mat_q4_0_f32;
+    cl_program program_legacy_mul_mat_q4_0_f32_r8;
     cl_program program_legacy_ops_f32;
     cl_program program_legacy_flash_attn_decode_f32_f16;
 
@@ -793,6 +794,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_iq4_nl_f32_l4_lm;
     cl_kernel kernel_legacy_mul_mat_q4_0_f32;
     cl_kernel kernel_legacy_mul_mat_q4_0_f32_r4;
+    cl_kernel kernel_legacy_mul_mat_q4_0_f32_r8;
 
     std::vector<ProfilingInfo> profiling_info;
 
@@ -1393,10 +1395,16 @@ static size_t ggml_opencl_legacy_q4_0_mul_mat_lws(ggml_backend_opencl_context * 
 }
 
 static int ggml_opencl_legacy_q4_0_mul_mat_row_tile(ggml_backend_opencl_context * ctx, int ne01) {
-    if (ctx->legacy_q4_0_mul_mat_row_tile <= 1 || ctx->kernel_legacy_mul_mat_q4_0_f32_r4 == nullptr) {
-        return 1;
+    const int rows = std::max(ne01, 1);
+    const int requested = ctx->legacy_q4_0_mul_mat_row_tile;
+
+    if (requested >= 8 && ctx->kernel_legacy_mul_mat_q4_0_f32_r8 != nullptr) {
+        return std::min(8, rows);
     }
-    return std::min(ctx->legacy_q4_0_mul_mat_row_tile, std::max(ne01, 1));
+    if (requested > 1 && ctx->kernel_legacy_mul_mat_q4_0_f32_r4 != nullptr) {
+        return std::min(std::min(requested, 4), rows);
+    }
+    return 1;
 }
 
 static void ggml_opencl_legacy_trace_record_compute(
@@ -1694,6 +1702,13 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
         }
         ctx->kernel_legacy_mul_mat_q4_0_f32_r4 = nullptr;
     }
+    if (ctx->kernel_legacy_mul_mat_q4_0_f32_r8 != nullptr) {
+        cl_int err = clReleaseKernel(ctx->kernel_legacy_mul_mat_q4_0_f32_r8);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 row-tile r8 kernel: %d\n", err);
+        }
+        ctx->kernel_legacy_mul_mat_q4_0_f32_r8 = nullptr;
+    }
 
     cl_kernel * legacy_ops[] = {
         &ctx->kernel_add,
@@ -1725,6 +1740,13 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
             GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 program: %d\n", err);
         }
         ctx->program_legacy_mul_mat_q4_0_f32 = nullptr;
+    }
+    if (ctx->program_legacy_mul_mat_q4_0_f32_r8 != nullptr) {
+        cl_int err = clReleaseProgram(ctx->program_legacy_mul_mat_q4_0_f32_r8);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 row-tile r8 program: %d\n", err);
+        }
+        ctx->program_legacy_mul_mat_q4_0_f32_r8 = nullptr;
     }
 
     if (ctx->program_legacy_ops_f32 != nullptr) {
@@ -2962,6 +2984,215 @@ __kernel void ggml_legacy_mul_mat_q4_0_f32_r4(
         }
     }
 }
+
+#ifdef GGML_LEGACY_Q4_0_R8
+__kernel void ggml_legacy_mul_mat_q4_0_f32_r8(
+        __global const void * src0,
+        ulong offset0,
+        __global const float * src1,
+        ulong offset1,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne11,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int row_tile,
+        __local float * tmp) {
+    const int row_base = get_group_id(0) * row_tile;
+    const int col = get_group_id(1);
+    const int im  = get_group_id(2);
+    const int tid = get_local_id(0);
+    const int local_size = get_local_size(0);
+
+    const int i12 = im % ne12;
+    const int i13 = im / ne12;
+    const int nb = ne00 / QK4_0;
+
+    const ulong x_base_offset = offset0 +
+        (ulong)(i12 / r2) * nb02 + (ulong)(i13 / r3) * nb03;
+    __global const char * src0_base = (__global const char *)src0 + x_base_offset;
+
+    const int row0 = row_base + 0;
+    const int row1 = row_base + 1;
+    const int row2 = row_base + 2;
+    const int row3 = row_base + 3;
+    const int row4 = row_base + 4;
+    const int row5 = row_base + 5;
+    const int row6 = row_base + 6;
+    const int row7 = row_base + 7;
+    const int valid0 = row0 < ne01;
+    const int valid1 = row_tile > 1 && row1 < ne01;
+    const int valid2 = row_tile > 2 && row2 < ne01;
+    const int valid3 = row_tile > 3 && row3 < ne01;
+    const int valid4 = row_tile > 4 && row4 < ne01;
+    const int valid5 = row_tile > 5 && row5 < ne01;
+    const int valid6 = row_tile > 6 && row6 < ne01;
+    const int valid7 = row_tile > 7 && row7 < ne01;
+
+    __global const struct block_q4_0 * x0 = (__global const struct block_q4_0 *)(src0_base + (ulong)row0 * nb01);
+    __global const struct block_q4_0 * x1 = valid1 ? (__global const struct block_q4_0 *)(src0_base + (ulong)row1 * nb01) : x0;
+    __global const struct block_q4_0 * x2 = valid2 ? (__global const struct block_q4_0 *)(src0_base + (ulong)row2 * nb01) : x0;
+    __global const struct block_q4_0 * x3 = valid3 ? (__global const struct block_q4_0 *)(src0_base + (ulong)row3 * nb01) : x0;
+    __global const struct block_q4_0 * x4 = valid4 ? (__global const struct block_q4_0 *)(src0_base + (ulong)row4 * nb01) : x0;
+    __global const struct block_q4_0 * x5 = valid5 ? (__global const struct block_q4_0 *)(src0_base + (ulong)row5 * nb01) : x0;
+    __global const struct block_q4_0 * x6 = valid6 ? (__global const struct block_q4_0 *)(src0_base + (ulong)row6 * nb01) : x0;
+    __global const struct block_q4_0 * x7 = valid7 ? (__global const struct block_q4_0 *)(src0_base + (ulong)row7 * nb01) : x0;
+
+    __global const char * y = (__global const char *)src1 + offset1 +
+        (ulong)col * nb11 + (ulong)i12 * nb12 + (ulong)i13 * nb13;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    float sum6 = 0.0f;
+    float sum7 = 0.0f;
+
+    for (int ib = tid; ib < nb; ib += local_size) {
+        const float d0 = vload_half(0, &x0[ib].d);
+        const float d1 = vload_half(0, &x1[ib].d);
+        const float d2 = vload_half(0, &x2[ib].d);
+        const float d3 = vload_half(0, &x3[ib].d);
+        const float d4 = vload_half(0, &x4[ib].d);
+        const float d5 = vload_half(0, &x5[ib].d);
+        const float d6 = vload_half(0, &x6[ib].d);
+        const float d7 = vload_half(0, &x7[ib].d);
+        __global const uint8_t * qs0 = x0[ib].qs;
+        __global const uint8_t * qs1 = x1[ib].qs;
+        __global const uint8_t * qs2 = x2[ib].qs;
+        __global const uint8_t * qs3 = x3[ib].qs;
+        __global const uint8_t * qs4 = x4[ib].qs;
+        __global const uint8_t * qs5 = x5[ib].qs;
+        __global const uint8_t * qs6 = x6[ib].qs;
+        __global const uint8_t * qs7 = x7[ib].qs;
+        const int y_base = ib * QK4_0;
+
+        for (int i = 0; i < QK4_0 / 2; ++i) {
+            const float y0 = *(__global const float *)(y + (ulong)(y_base + i) * nb10);
+            const float y1 = *(__global const float *)(y + (ulong)(y_base + i + QK4_0 / 2) * nb10);
+            if (valid0) {
+                const uint8_t q = qs0[i];
+                sum0 += ((int)(q & 0x0F) - 8) * d0 * y0 + ((int)(q >> 4) - 8) * d0 * y1;
+            }
+            if (valid1) {
+                const uint8_t q = qs1[i];
+                sum1 += ((int)(q & 0x0F) - 8) * d1 * y0 + ((int)(q >> 4) - 8) * d1 * y1;
+            }
+            if (valid2) {
+                const uint8_t q = qs2[i];
+                sum2 += ((int)(q & 0x0F) - 8) * d2 * y0 + ((int)(q >> 4) - 8) * d2 * y1;
+            }
+            if (valid3) {
+                const uint8_t q = qs3[i];
+                sum3 += ((int)(q & 0x0F) - 8) * d3 * y0 + ((int)(q >> 4) - 8) * d3 * y1;
+            }
+            if (valid4) {
+                const uint8_t q = qs4[i];
+                sum4 += ((int)(q & 0x0F) - 8) * d4 * y0 + ((int)(q >> 4) - 8) * d4 * y1;
+            }
+            if (valid5) {
+                const uint8_t q = qs5[i];
+                sum5 += ((int)(q & 0x0F) - 8) * d5 * y0 + ((int)(q >> 4) - 8) * d5 * y1;
+            }
+            if (valid6) {
+                const uint8_t q = qs6[i];
+                sum6 += ((int)(q & 0x0F) - 8) * d6 * y0 + ((int)(q >> 4) - 8) * d6 * y1;
+            }
+            if (valid7) {
+                const uint8_t q = qs7[i];
+                sum7 += ((int)(q & 0x0F) - 8) * d7 * y0 + ((int)(q >> 4) - 8) * d7 * y1;
+            }
+        }
+    }
+
+    tmp[tid] = sum0;
+    if (row_tile > 1) tmp[local_size + tid] = sum1;
+    if (row_tile > 2) tmp[2 * local_size + tid] = sum2;
+    if (row_tile > 3) tmp[3 * local_size + tid] = sum3;
+    if (row_tile > 4) tmp[4 * local_size + tid] = sum4;
+    if (row_tile > 5) tmp[5 * local_size + tid] = sum5;
+    if (row_tile > 6) tmp[6 * local_size + tid] = sum6;
+    if (row_tile > 7) tmp[7 * local_size + tid] = sum7;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            tmp[tid] += tmp[tid + stride];
+            if (row_tile > 1) tmp[local_size + tid] += tmp[local_size + tid + stride];
+            if (row_tile > 2) tmp[2 * local_size + tid] += tmp[2 * local_size + tid + stride];
+            if (row_tile > 3) tmp[3 * local_size + tid] += tmp[3 * local_size + tid + stride];
+            if (row_tile > 4) tmp[4 * local_size + tid] += tmp[4 * local_size + tid + stride];
+            if (row_tile > 5) tmp[5 * local_size + tid] += tmp[5 * local_size + tid + stride];
+            if (row_tile > 6) tmp[6 * local_size + tid] += tmp[6 * local_size + tid + stride];
+            if (row_tile > 7) tmp[7 * local_size + tid] += tmp[7 * local_size + tid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid == 0) {
+        if (valid0) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row0 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[0];
+        }
+        if (valid1) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row1 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[local_size];
+        }
+        if (valid2) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row2 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[2 * local_size];
+        }
+        if (valid3) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row3 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[3 * local_size];
+        }
+        if (valid4) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row4 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[4 * local_size];
+        }
+        if (valid5) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row5 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[5 * local_size];
+        }
+        if (valid6) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row6 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[6 * local_size];
+        }
+        if (valid7) {
+            __global char * out = (__global char *)dst + offsetd +
+                (ulong)row7 * nb0 + (ulong)col * nb1 + (ulong)i12 * nb2 + (ulong)i13 * nb3;
+            *(__global float *)out = tmp[7 * local_size];
+        }
+    }
+}
+#endif
 )CLC";
 
     backend_ctx->program_legacy_mul_mat_q4_0_f32 =
@@ -2971,8 +3202,31 @@ __kernel void ggml_legacy_mul_mat_q4_0_f32_r4(
         clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32, "ggml_legacy_mul_mat_q4_0_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r4 =
         clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32, "ggml_legacy_mul_mat_q4_0_f32_r4", &err), err));
+    if (backend_ctx->legacy_q4_0_mul_mat_row_tile >= 8) {
+        const std::string q4_0_r8_compile_opts = compile_opts + " -DGGML_LEGACY_Q4_0_R8=1";
+        backend_ctx->program_legacy_mul_mat_q4_0_f32_r8 =
+            try_build_program_from_source(
+                backend_ctx->context,
+                backend_ctx->device,
+                "legacy-q4_0-r8",
+                q4_0_kernel,
+                q4_0_r8_compile_opts);
+        if (backend_ctx->program_legacy_mul_mat_q4_0_f32_r8 != nullptr) {
+            backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8 =
+                clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32_r8, "ggml_legacy_mul_mat_q4_0_f32_r8", &err);
+            if (err != CL_SUCCESS) {
+                GGML_LOG_WARN("ggml_opencl: optional legacy Q4_0 row-tile r8 kernel failed to create: %d\n", err);
+                backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8 = nullptr;
+            }
+        }
+        if (backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8 == nullptr) {
+            GGML_LOG_WARN("ggml_opencl: legacy Q4_0 row tile 8 unavailable; falling back to row tile 4\n");
+        }
+    }
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 matmul kernel: true\n");
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 row-tile matmul kernel: true\n");
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 row-tile r8 matmul kernel: %s\n",
+        backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8 != nullptr ? "true" : "false");
 
     return true;
 }
@@ -5396,7 +5650,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->legacy_q4_0_mul_mat_lws =
         ggml_opencl_env_int("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_LWS", 0);
     backend_ctx->legacy_q4_0_mul_mat_row_tile =
-        ggml_opencl_env_int("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_ROW_TILE", 1);
+        ggml_opencl_env_int("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_ROW_TILE", 4);
     backend_ctx->legacy_trace_graphs = 0;
     backend_ctx->legacy_trace_nodes = 0;
     backend_ctx->legacy_trace_support_queries = 0;
@@ -5575,11 +5829,12 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
         if (backend_ctx->legacy_q4_0_mul_mat_row_tile != 1 &&
                 backend_ctx->legacy_q4_0_mul_mat_row_tile != 2 &&
-                backend_ctx->legacy_q4_0_mul_mat_row_tile != 4) {
+                backend_ctx->legacy_q4_0_mul_mat_row_tile != 4 &&
+                backend_ctx->legacy_q4_0_mul_mat_row_tile != 8) {
             GGML_LOG_WARN(
-                "ggml_opencl: ignoring invalid legacy Q4_0 matmul row tile %d; using 1\n",
+                "ggml_opencl: ignoring invalid legacy Q4_0 matmul row tile %d; using 4\n",
                 backend_ctx->legacy_q4_0_mul_mat_row_tile);
-            backend_ctx->legacy_q4_0_mul_mat_row_tile = 1;
+            backend_ctx->legacy_q4_0_mul_mat_row_tile = 4;
         }
         GGML_LOG_INFO(
             "ggml_opencl: legacy NVIDIA Q4_0 matmul row tile: %d\n",
@@ -14382,7 +14637,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         const size_t local_size = ggml_opencl_legacy_q4_0_mul_mat_lws(backend_ctx, ne00);
         const int row_tile = ggml_opencl_legacy_q4_0_mul_mat_row_tile(backend_ctx, ne01);
-        if (row_tile > 1) {
+        if (row_tile > 4) {
+            legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8;
+            GGML_ASSERT(legacy_kernel != nullptr);
+        } else if (row_tile > 1) {
             legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r4;
             GGML_ASSERT(legacy_kernel != nullptr);
         }
