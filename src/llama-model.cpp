@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -686,6 +687,11 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+}
+
+static bool llama_env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 && strcmp(value, "false") != 0;
 }
 
 void llama_model::load_stats(llama_model_loader & ml) {
@@ -3012,6 +3018,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
+    const bool fermi_opencl_output_cpu_requested = llama_env_enabled("LLAMA_FERMI_OPENCL_OUTPUT_CPU");
+    const bool has_gpu_opencl = std::any_of(devices.begin(), devices.end(), [](const llama_device & dev) {
+        return !dev.is_meta && dev.dev != nullptr && strcmp(ggml_backend_dev_name(dev.dev), "GPUOpenCL") == 0;
+    });
+    const bool fermi_opencl_output_cpu = fermi_opencl_output_cpu_requested && has_gpu_opencl;
+
+    if (fermi_opencl_output_cpu_requested && !has_gpu_opencl) {
+        LLAMA_LOG_WARN("%s: LLAMA_FERMI_OPENCL_OUTPUT_CPU was set, but no GPUOpenCL device is active; ignoring\n", __func__);
+    }
+
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
@@ -3070,7 +3086,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer);
+    if (fermi_opencl_output_cpu) {
+        LLAMA_LOG_INFO("%s: LLAMA_FERMI_OPENCL_OUTPUT_CPU forcing output layer to CPU\n", __func__);
+        pimpl->dev_output = { cpu_dev, &pimpl->cpu_buft_list };
+    } else {
+        pimpl->dev_output = get_layer_buft_list(n_layer);
+    }
 
     const auto TENSOR_DUPLICATED      = llama_model_loader::TENSOR_DUPLICATED;
     const auto TENSOR_NOT_REQUIRED    = llama_model_loader::TENSOR_NOT_REQUIRED;
@@ -8022,19 +8043,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
+        const bool output_on_gpu = pimpl->dev_output.dev != cpu_dev;
+        int n_repeating = 0;
+        for (const auto & dev_layer : pimpl->dev_layer) {
+            if (dev_layer.dev != cpu_dev) {
+                n_repeating++;
+            }
+        }
 
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
+        if (output_on_gpu) {
             LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
         }
         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
         const int max_backend_supported_layers = hparams.n_layer + 1;
-        const int max_offloadable_layers       = hparams.n_layer + 1;
 
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, n_repeating + (output_on_gpu ? 1 : 0), max_backend_supported_layers);
     }
 
     // print memory requirements per buffer type
