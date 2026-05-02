@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -358,6 +359,64 @@ static void populateProfilingInfo(
 
 struct ggml_backend_opencl_context;
 
+static bool ggml_opencl_env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 && strcmp(value, "false") != 0;
+}
+
+static const char * ggml_opencl_bool(bool value) {
+    return value ? "true" : "false";
+}
+
+static const char * ggml_opencl_tensor_name(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return "<null>";
+    }
+    return tensor->name[0] ? tensor->name : "<unnamed>";
+}
+
+static const char * ggml_opencl_tensor_residency(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return "none";
+    }
+    if (tensor->extra != nullptr) {
+        return "opencl";
+    }
+    if (tensor->buffer != nullptr) {
+        return "buffer-no-extra";
+    }
+    return "host";
+}
+
+static void ggml_opencl_get_kernel_name(cl_kernel kernel, char * dst, size_t dst_size) {
+    if (dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    cl_int err = clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, dst_size, dst, nullptr);
+    if (err != CL_SUCCESS || dst[0] == '\0') {
+        snprintf(dst, dst_size, "<kernel:%d>", err);
+    }
+}
+
+static void ggml_opencl_legacy_trace_tensor(const char * prefix, const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        GGML_LOG_INFO("ggml_opencl: legacy trace %s tensor=<null>\n", prefix);
+        return;
+    }
+
+    GGML_LOG_INFO(
+        "ggml_opencl: legacy trace %s name=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] bytes=%zu residency=%s\n",
+        prefix,
+        ggml_opencl_tensor_name(tensor),
+        ggml_op_name(tensor->op),
+        ggml_type_name(tensor->type),
+        tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+        tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+        ggml_nbytes(tensor),
+        ggml_opencl_tensor_residency(tensor));
+}
+
 // backend device context
 struct ggml_backend_opencl_device_context {
     cl_platform_id platform;
@@ -408,6 +467,20 @@ struct ggml_backend_opencl_context {
     size_t  image_max_buffer_size;
     bool legacy_probe_only;
     bool legacy_half_storage_support;
+    bool legacy_trace;
+
+    uint64_t legacy_trace_graphs;
+    uint64_t legacy_trace_nodes;
+    uint64_t legacy_trace_support_queries;
+    uint64_t legacy_trace_support_accepted;
+    uint64_t legacy_trace_support_rejected;
+    uint64_t legacy_trace_kernel_launches;
+    uint64_t legacy_trace_h2d_count;
+    uint64_t legacy_trace_d2h_count;
+    uint64_t legacy_trace_h2d_bytes;
+    uint64_t legacy_trace_d2h_bytes;
+    uint64_t legacy_trace_sync_other_calls;
+    uint64_t legacy_trace_finish_calls;
 
     cl_context context;
     cl_command_queue queue;
@@ -700,6 +773,29 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+        if (gpu_family == GPU_FAMILY::NVIDIA_LEGACY && legacy_trace) {
+            legacy_trace_kernel_launches++;
+
+            char kernel_name[128];
+            ggml_opencl_get_kernel_name(kernel, kernel_name, sizeof(kernel_name));
+
+            size_t lws[3] = { 0, 0, 0 };
+            size_t gws[3] = { 0, 0, 0 };
+            for (cl_uint i = 0; i < work_dim && i < 3; ++i) {
+                gws[i] = global_work_size ? global_work_size[i] : 0;
+                lws[i] = local_work_size ? local_work_size[i] : 0;
+            }
+
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace kernel #%" PRIu64 " name=%s tensor=%s op=%s gws=[%zu,%zu,%zu] lws=[%zu,%zu,%zu]\n",
+                legacy_trace_kernel_launches,
+                kernel_name,
+                ggml_opencl_tensor_name(tensor),
+                tensor ? ggml_op_name(tensor->op) : "<none>",
+                gws[0], gws[1], gws[2],
+                lws[0], lws[1], lws[2]);
+        }
+
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
@@ -707,7 +803,6 @@ struct ggml_backend_opencl_context {
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
 #else
-        GGML_UNUSED(tensor);
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
     }
@@ -776,6 +871,12 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
     }
 
     if (ctx->queue != nullptr) {
+        if (ctx->legacy_trace) {
+            ctx->legacy_trace_finish_calls++;
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace clFinish #%" PRIu64 " reason=release\n",
+                ctx->legacy_trace_finish_calls);
+        }
         clFinish(ctx->queue);
     }
 
@@ -3442,6 +3543,19 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->image_max_buffer_size = 0;
     backend_ctx->legacy_probe_only = false;
     backend_ctx->legacy_half_storage_support = false;
+    backend_ctx->legacy_trace = ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_TRACE");
+    backend_ctx->legacy_trace_graphs = 0;
+    backend_ctx->legacy_trace_nodes = 0;
+    backend_ctx->legacy_trace_support_queries = 0;
+    backend_ctx->legacy_trace_support_accepted = 0;
+    backend_ctx->legacy_trace_support_rejected = 0;
+    backend_ctx->legacy_trace_kernel_launches = 0;
+    backend_ctx->legacy_trace_h2d_count = 0;
+    backend_ctx->legacy_trace_d2h_count = 0;
+    backend_ctx->legacy_trace_h2d_bytes = 0;
+    backend_ctx->legacy_trace_d2h_bytes = 0;
+    backend_ctx->legacy_trace_sync_other_calls = 0;
+    backend_ctx->legacy_trace_finish_calls = 0;
 
     // ref_count get increased in ggml_backend_opencl_device_init
     // This function is also used to retrieve backend context, so we don't want
@@ -3527,6 +3641,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
     if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
         GGML_LOG_WARN("ggml_opencl: NVIDIA legacy mode enabled; only Q4_0 x F32 matmul is supported\n");
+        if (backend_ctx->legacy_trace) {
+            GGML_LOG_INFO("ggml_opencl: legacy NVIDIA trace enabled via GGML_OPENCL_NVIDIA_LEGACY_TRACE\n");
+        }
 
         cl_uint base_align_in_bits;
         CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
@@ -4226,6 +4343,12 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     }
 
     if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        if (backend_ctx->legacy_trace) {
+            backend_ctx->legacy_trace_finish_calls++;
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace clFinish #%" PRIu64 " reason=synchronize\n",
+                backend_ctx->legacy_trace_finish_calls);
+        }
         cl_int err = clFinish(backend_ctx->queue);
         if (err != CL_SUCCESS) {
             GGML_LOG_WARN("ggml_opencl: legacy NVIDIA clFinish failed during synchronize: %d\n", err);
@@ -4243,8 +4366,16 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
 // enqueued to it won't start until commands in the other devices have
 // completed.
 static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx) {
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY && backend_ctx->legacy_trace) {
+        backend_ctx->legacy_trace_sync_other_calls++;
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace sync-other #%" PRIu64 " devices=%zu\n",
+            backend_ctx->legacy_trace_sync_other_calls,
+            g_ggml_backend_opencl_devices.size());
+    }
+
     if (g_ggml_backend_opencl_devices.size() < 2)
-      return; // No other devices to synchronize with.
+        return; // No other devices to synchronize with.
 
     std::vector<cl_event> events;
     events.reserve(g_ggml_backend_opencl_devices.size());
@@ -4344,6 +4475,23 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    const bool legacy_trace =
+        backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY && backend_ctx->legacy_trace;
+    const uint64_t graph_start_nodes   = backend_ctx->legacy_trace_nodes;
+    const uint64_t graph_start_kernels = backend_ctx->legacy_trace_kernel_launches;
+    const uint64_t graph_start_h2d     = backend_ctx->legacy_trace_h2d_bytes;
+    const uint64_t graph_start_d2h     = backend_ctx->legacy_trace_d2h_bytes;
+    const uint64_t graph_start_sync    = backend_ctx->legacy_trace_sync_other_calls;
+    const uint64_t graph_start_finish  = backend_ctx->legacy_trace_finish_calls;
+
+    if (legacy_trace) {
+        backend_ctx->legacy_trace_graphs++;
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace graph #%" PRIu64 " begin nodes=%d\n",
+            backend_ctx->legacy_trace_graphs,
+            cgraph->n_nodes);
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -4360,27 +4508,84 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
+        if (legacy_trace) {
+            backend_ctx->legacy_trace_nodes++;
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace graph #%" PRIu64 " node #%" PRIu64 " index=%d name=%s op=%s compute=%s\n",
+                backend_ctx->legacy_trace_graphs,
+                backend_ctx->legacy_trace_nodes,
+                i,
+                ggml_opencl_tensor_name(node),
+                ggml_op_name(node->op),
+                ggml_opencl_bool((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0));
+            ggml_opencl_legacy_trace_tensor("node", node);
+            ggml_opencl_legacy_trace_tensor("src0", node->src[0]);
+            ggml_opencl_legacy_trace_tensor("src1", node->src[1]);
+        }
+
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            const uint64_t kernels_before = backend_ctx->legacy_trace_kernel_launches;
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (legacy_trace) {
+                GGML_LOG_INFO(
+                    "ggml_opencl: legacy trace fused node=%s ops=NORM+MUL+ADD kernel_delta=%" PRIu64 "\n",
+                    ggml_opencl_tensor_name(node),
+                    backend_ctx->legacy_trace_kernel_launches - kernels_before);
+            }
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            const uint64_t kernels_before = backend_ctx->legacy_trace_kernel_launches;
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (legacy_trace) {
+                GGML_LOG_INFO(
+                    "ggml_opencl: legacy trace fused node=%s ops=GROUP_NORM+MUL+ADD kernel_delta=%" PRIu64 "\n",
+                    ggml_opencl_tensor_name(node),
+                    backend_ctx->legacy_trace_kernel_launches - kernels_before);
+            }
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            const uint64_t kernels_before = backend_ctx->legacy_trace_kernel_launches;
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+            if (legacy_trace) {
+                GGML_LOG_INFO(
+                    "ggml_opencl: legacy trace fused node=%s ops=RMS_NORM+MUL kernel_delta=%" PRIu64 "\n",
+                    ggml_opencl_tensor_name(node),
+                    backend_ctx->legacy_trace_kernel_launches - kernels_before);
+            }
             i++;
             continue;
         }
 
+        const uint64_t kernels_before = backend_ctx->legacy_trace_kernel_launches;
         bool ok = ggml_cl_compute_forward(backend, node);
+        if (legacy_trace) {
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace node result name=%s op=%s ok=%s kernel_delta=%" PRIu64 "\n",
+                ggml_opencl_tensor_name(node),
+                ggml_op_name(node->op),
+                ggml_opencl_bool(ok),
+                backend_ctx->legacy_trace_kernel_launches - kernels_before);
+        }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+
+    if (legacy_trace) {
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace graph #%" PRIu64 " summary nodes=%" PRIu64 " kernels=%" PRIu64 " h2d_bytes=%" PRIu64 " d2h_bytes=%" PRIu64 " sync_other=%" PRIu64 " finishes=%" PRIu64 "\n",
+            backend_ctx->legacy_trace_graphs,
+            backend_ctx->legacy_trace_nodes - graph_start_nodes,
+            backend_ctx->legacy_trace_kernel_launches - graph_start_kernels,
+            backend_ctx->legacy_trace_h2d_bytes - graph_start_h2d,
+            backend_ctx->legacy_trace_d2h_bytes - graph_start_d2h,
+            backend_ctx->legacy_trace_sync_other_calls - graph_start_sync,
+            backend_ctx->legacy_trace_finish_calls - graph_start_finish);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -4388,6 +4593,41 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 
 static bool ggml_opencl_is_fermi_debug_tensor(const ggml_tensor * tensor) {
     return tensor != nullptr && strcmp(tensor->name, "output.weight") == 0;
+}
+
+static void ggml_opencl_legacy_trace_support(
+        ggml_backend_opencl_context * backend_ctx,
+        const ggml_tensor * op,
+        bool supported,
+        const char * reason) {
+    if (!backend_ctx->legacy_trace) {
+        return;
+    }
+
+    backend_ctx->legacy_trace_support_queries++;
+    if (supported) {
+        backend_ctx->legacy_trace_support_accepted++;
+    } else {
+        backend_ctx->legacy_trace_support_rejected++;
+    }
+
+    GGML_LOG_INFO(
+        "ggml_opencl: legacy trace supports_op #%" PRIu64 " supported=%s reason=%s name=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0=%s/%s/%s src1=%s/%s/%s totals=[accepted=%" PRIu64 ",rejected=%" PRIu64 "]\n",
+        backend_ctx->legacy_trace_support_queries,
+        ggml_opencl_bool(supported),
+        reason,
+        ggml_opencl_tensor_name(op),
+        op ? ggml_op_name(op->op) : "<none>",
+        op ? ggml_type_name(op->type) : "<none>",
+        op ? op->ne[0] : 0, op ? op->ne[1] : 0, op ? op->ne[2] : 0, op ? op->ne[3] : 0,
+        ggml_opencl_tensor_name(op ? op->src[0] : nullptr),
+        op && op->src[0] ? ggml_type_name(op->src[0]->type) : "<none>",
+        ggml_opencl_tensor_residency(op ? op->src[0] : nullptr),
+        ggml_opencl_tensor_name(op ? op->src[1] : nullptr),
+        op && op->src[1] ? ggml_type_name(op->src[1]->type) : "<none>",
+        ggml_opencl_tensor_residency(op ? op->src[1] : nullptr),
+        backend_ctx->legacy_trace_support_accepted,
+        backend_ctx->legacy_trace_support_rejected);
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -4400,7 +4640,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 
     if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
         if (backend_ctx->legacy_probe_only) {
-            return op->op == GGML_OP_NONE;
+            const bool supported = op->op == GGML_OP_NONE;
+            ggml_opencl_legacy_trace_support(backend_ctx, op, supported, "probe-only");
+            return supported;
         }
 
         switch (op->op) {
@@ -4409,6 +4651,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             case GGML_OP_VIEW:
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
+                ggml_opencl_legacy_trace_support(backend_ctx, op, true, "metadata-op");
                 return true;
             case GGML_OP_MUL_MAT:
                 {
@@ -4427,20 +4670,24 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                  src1_ne2_ok && src1_ne3_ok && src0_nb0_ok &&
                                                  src1_nb0_ok && dst_nb0_ok && half_storage_ok && kernel_ok;
 
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "q4_0-f32-mul-mat" : "q4_0-f32-mul-mat-predicate-failed");
+
                     if (!supported && ggml_opencl_is_fermi_debug_tensor(op->src[0])) {
                         GGML_LOG_INFO(
                             "ggml_opencl: legacy NVIDIA rejects output.weight MUL_MAT: src0_q4_0=%s src1_f32=%s dst_f32=%s src0_block_ok=%s src1_ne2_ok=%s src1_ne3_ok=%s src0_nb0_ok=%s src1_nb0_ok=%s dst_nb0_ok=%s half_storage_ok=%s kernel_ok=%s src0_ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src1_ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] dst_ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src0_nb0=%zu src1_nb0=%zu dst_nb0=%zu\n",
-                            src0_q4_0 ? "true" : "false",
-                            src1_f32 ? "true" : "false",
-                            dst_f32 ? "true" : "false",
-                            src0_block_ok ? "true" : "false",
-                            src1_ne2_ok ? "true" : "false",
-                            src1_ne3_ok ? "true" : "false",
-                            src0_nb0_ok ? "true" : "false",
-                            src1_nb0_ok ? "true" : "false",
-                            dst_nb0_ok ? "true" : "false",
-                            half_storage_ok ? "true" : "false",
-                            kernel_ok ? "true" : "false",
+                            ggml_opencl_bool(src0_q4_0),
+                            ggml_opencl_bool(src1_f32),
+                            ggml_opencl_bool(dst_f32),
+                            ggml_opencl_bool(src0_block_ok),
+                            ggml_opencl_bool(src1_ne2_ok),
+                            ggml_opencl_bool(src1_ne3_ok),
+                            ggml_opencl_bool(src0_nb0_ok),
+                            ggml_opencl_bool(src1_nb0_ok),
+                            ggml_opencl_bool(dst_nb0_ok),
+                            ggml_opencl_bool(half_storage_ok),
+                            ggml_opencl_bool(kernel_ok),
                             op->src[0]->ne[0], op->src[0]->ne[1], op->src[0]->ne[2], op->src[0]->ne[3],
                             op->src[1]->ne[0], op->src[1]->ne[1], op->src[1]->ne[2], op->src[1]->ne[3],
                             op->ne[0], op->ne[1], op->ne[2], op->ne[3],
@@ -4450,6 +4697,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return supported;
                 }
             default:
+                ggml_opencl_legacy_trace_support(backend_ctx, op, false, "unsupported-op");
                 return false;
         }
     }
@@ -5169,6 +5417,19 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
         ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
         GGML_ASSERT(extra);
+
+        if (backend_ctx->legacy_trace) {
+            backend_ctx->legacy_trace_h2d_count++;
+            backend_ctx->legacy_trace_h2d_bytes += size;
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace h2d #%" PRIu64 " tensor=%s type=%s offset=%zu size=%zu total_bytes=%" PRIu64 "\n",
+                backend_ctx->legacy_trace_h2d_count,
+                ggml_opencl_tensor_name(tensor),
+                ggml_type_name(tensor->type),
+                extra->offset + offset,
+                size,
+                backend_ctx->legacy_trace_h2d_bytes);
+        }
 
         CL_CHECK(clEnqueueWriteBuffer(
             queue, extra->data_device, CL_TRUE, extra->offset + offset,
@@ -6134,6 +6395,19 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
         GGML_ASSERT(extra);
 
+        if (backend_ctx->legacy_trace) {
+            backend_ctx->legacy_trace_d2h_count++;
+            backend_ctx->legacy_trace_d2h_bytes += size;
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace d2h #%" PRIu64 " tensor=%s type=%s offset=%zu size=%zu total_bytes=%" PRIu64 "\n",
+                backend_ctx->legacy_trace_d2h_count,
+                ggml_opencl_tensor_name(tensor),
+                ggml_type_name(tensor->type),
+                extra->offset + tensor->view_offs + offset,
+                size,
+                backend_ctx->legacy_trace_d2h_bytes);
+        }
+
         CL_CHECK(clEnqueueReadBuffer(
             queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
             size, data, 0, NULL, NULL));
@@ -6780,6 +7054,13 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
     for (cl_mem buf : ctx->buffer) {
         CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
+    }
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY && backend_ctx->legacy_trace) {
+        backend_ctx->legacy_trace_finish_calls++;
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace clFinish #%" PRIu64 " reason=buffer-clear size=%zu\n",
+            backend_ctx->legacy_trace_finish_calls,
+            buffer->size);
     }
     CL_CHECK(clFinish(queue));
 }
