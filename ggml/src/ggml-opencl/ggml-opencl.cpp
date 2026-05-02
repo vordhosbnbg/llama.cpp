@@ -598,6 +598,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mm_q8_0_f32_l4_lm;
     cl_program program_legacy_mul_mat_q4_0_f32;
     cl_program program_legacy_ops_f32;
+    cl_program program_legacy_flash_attn_decode_f32_f16;
 
     cl_kernel kernel_add, kernel_add_row, kernel_add_f16, kernel_add_row_f16;
     cl_kernel kernel_mul, kernel_mul_row, kernel_mul_f16, kernel_mul_row_f16;
@@ -639,6 +640,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
+    cl_kernel kernel_legacy_flash_attn_decode_f32_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
@@ -1256,6 +1258,7 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
         &ctx->kernel_rope_norm_f32,
         &ctx->kernel_rope_neox_f32,
         &ctx->kernel_swiglu,
+        &ctx->kernel_legacy_flash_attn_decode_f32_f16,
     };
     for (cl_kernel * kernel : legacy_ops) {
         if (*kernel != nullptr) {
@@ -1281,6 +1284,14 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
             GGML_LOG_WARN("ggml_opencl: failed to release legacy F32 op program: %d\n", err);
         }
         ctx->program_legacy_ops_f32 = nullptr;
+    }
+
+    if (ctx->program_legacy_flash_attn_decode_f32_f16 != nullptr) {
+        cl_int err = clReleaseProgram(ctx->program_legacy_flash_attn_decode_f32_f16);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy decode attention program: %d\n", err);
+        }
+        ctx->program_legacy_flash_attn_decode_f32_f16 = nullptr;
     }
 }
 
@@ -1324,6 +1335,40 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     }
 
     return p;
+}
+
+static cl_program try_build_program_from_source(
+        cl_context         ctx,
+        cl_device_id       dev,
+        const char *       program_name,
+        const char *       program_buffer,
+        const std::string &compile_opts) {
+    cl_int err;
+    size_t program_size = strlen(program_buffer);
+
+    cl_program program = clCreateProgramWithSource(ctx, 1, &program_buffer, &program_size, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: optional program '%s' failed to create: %d\n", program_name, err);
+        return nullptr;
+    }
+
+    err = clBuildProgram(program, 1, &dev, compile_opts.c_str(), NULL, NULL);
+    if (err != CL_SUCCESS) {
+        size_t log_size = 0;
+        clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+
+        std::string program_log(log_size + 1, '\0');
+        if (log_size > 0) {
+            clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, log_size, &program_log[0], NULL);
+        }
+
+        GGML_LOG_WARN("ggml_opencl: optional program '%s' kernel compile warning:\n\n%s\n",
+            program_name, program_log.c_str());
+        CL_CHECK(clReleaseProgram(program));
+        return nullptr;
+    }
+
+    return program;
 }
 
 static bool try_build_probe_program(
@@ -1931,6 +1976,7 @@ __kernel void kernel_rope_neox_f32(
         }
     }
 }
+
 )CLC";
 
     backend_ctx->program_legacy_ops_f32 =
@@ -1958,6 +2004,220 @@ __kernel void kernel_rope_neox_f32(
     CL_CHECK((backend_ctx->kernel_swiglu =
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_swiglu", &err), err));
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA F32 op kernels: true\n");
+
+    static const char * legacy_flash_attn_decode_kernel = R"CLC(
+#define LEGACY_ATTN_D 128
+#define LEGACY_ATTN_VEC (LEGACY_ATTN_D / 4)
+#define LEGACY_ATTN_WG 64
+
+float4 ggml_legacy_vload_half4(__global const char * ptr, int ivec) {
+    __global const half * hptr = (__global const half *)ptr + 4 * ivec;
+    return (float4)(
+        vload_half(0, hptr + 0),
+        vload_half(0, hptr + 1),
+        vload_half(0, hptr + 2),
+        vload_half(0, hptr + 3));
+}
+
+float ggml_legacy_vload_half_at(__global const char * ptr, int idx) {
+    return vload_half(0, (__global const half *)ptr + idx);
+}
+
+__kernel void kernel_flash_attn_decode_f32_f16(
+        __global const void * q_void,
+        ulong q_offset,
+        __global const void * k_void,
+        ulong k_offset,
+        __global const void * v_void,
+        ulong v_offset,
+        __global void * o_void,
+        ulong o_offset,
+        float scale,
+        int n_q,
+        int n_kv,
+        int is_causal,
+        int n_head,
+        ulong q_nb1,
+        ulong q_nb2,
+        ulong q_nb3,
+        ulong k_nb1,
+        ulong k_nb2,
+        ulong k_nb3,
+        ulong v_nb1,
+        ulong v_nb2,
+        ulong v_nb3,
+        ulong o_nb1,
+        ulong o_nb2,
+        ulong o_nb3,
+        float max_bias,
+        float m0,
+        float m1,
+        int n_head_log2,
+        float logit_softcap,
+        int n_head_kv,
+        __global const void * mask_void,
+        ulong mask_offset,
+        ulong mask_nb1,
+        ulong mask_nb2,
+        ulong mask_nb3,
+        int mask_ne2,
+        int mask_ne3,
+        __global const void * sinks_void,
+        ulong sinks_offset) {
+    (void)n_q; (void)is_causal; (void)o_nb2; (void)mask_nb1;
+    (void)max_bias; (void)m0; (void)m1; (void)n_head_log2;
+    (void)logit_softcap; (void)sinks_void; (void)sinks_offset;
+
+    const int tid = get_local_id(0);
+    const int head_batch_idx = get_global_id(1);
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx = head_batch_idx - batch_idx * n_head;
+    const int gqa_ratio = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+
+    __global const char * q_base = (__global const char *)q_void + q_offset;
+    __global const char * k_base = (__global const char *)k_void + k_offset;
+    __global const char * v_base = (__global const char *)v_void + v_offset;
+    __global char * o_base = (__global char *)o_void + o_offset;
+
+    __global const char * mask_base = 0;
+    if (mask_void != 0) {
+        const int mask_head_idx = head_idx % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (__global const char *)mask_void + mask_offset +
+            (ulong)mask_batch_idx * mask_nb3 + (ulong)mask_head_idx * mask_nb2;
+    }
+
+    const ulong q_row_offset = (ulong)batch_idx * q_nb3 + (ulong)head_idx * q_nb2;
+    __global const float4 * q_row = (__global const float4 *)(q_base + q_row_offset);
+
+    float4 q_priv[LEGACY_ATTN_VEC];
+    #pragma unroll
+    for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
+        q_priv[i] = q_row[i];
+    }
+
+    float m_i = -INFINITY;
+    for (int k_idx = tid; k_idx < n_kv; k_idx += LEGACY_ATTN_WG) {
+        const ulong k_row_offset =
+            (ulong)batch_idx * k_nb3 + (ulong)head_kv_idx * k_nb2 + (ulong)k_idx * k_nb1;
+        __global const char * k_row = k_base + k_row_offset;
+
+        float4 dot_acc = (float4)(0.0f);
+        #pragma unroll
+        for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
+            dot_acc = mad(q_priv[i], ggml_legacy_vload_half4(k_row, i), dot_acc);
+        }
+
+        float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (mask_base != 0) {
+            score += ggml_legacy_vload_half_at(mask_base, k_idx);
+        }
+        m_i = max(m_i, score);
+    }
+
+    __local float local_m[LEGACY_ATTN_WG];
+    local_m[tid] = m_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int stride = LEGACY_ATTN_WG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            local_m[tid] = max(local_m[tid], local_m[tid + stride]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float m_final = local_m[0];
+
+    float4 o_acc[LEGACY_ATTN_VEC];
+    #pragma unroll
+    for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
+        o_acc[i] = (float4)(0.0f);
+    }
+
+    float l_i = 0.0f;
+    for (int k_idx = tid; k_idx < n_kv; k_idx += LEGACY_ATTN_WG) {
+        const ulong k_row_offset =
+            (ulong)batch_idx * k_nb3 + (ulong)head_kv_idx * k_nb2 + (ulong)k_idx * k_nb1;
+        const ulong v_row_offset =
+            (ulong)batch_idx * v_nb3 + (ulong)head_kv_idx * v_nb2 + (ulong)k_idx * v_nb1;
+        __global const char * k_row = k_base + k_row_offset;
+        __global const char * v_row = v_base + v_row_offset;
+
+        float4 dot_acc = (float4)(0.0f);
+        #pragma unroll
+        for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
+            dot_acc = mad(q_priv[i], ggml_legacy_vload_half4(k_row, i), dot_acc);
+        }
+
+        float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (mask_base != 0) {
+            score += ggml_legacy_vload_half_at(mask_base, k_idx);
+        }
+
+        const float p = exp(score - m_final);
+        l_i += p;
+        #pragma unroll
+        for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
+            o_acc[i] = mad(p, ggml_legacy_vload_half4(v_row, i), o_acc[i]);
+        }
+    }
+
+    __local float local_l[LEGACY_ATTN_WG];
+    __local float4 local_o[LEGACY_ATTN_WG];
+    local_l[tid] = l_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int stride = LEGACY_ATTN_WG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            local_l[tid] += local_l[tid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const float l_final = local_l[0];
+    const ulong o_row_offset = (ulong)batch_idx * o_nb3 + (ulong)head_idx * o_nb1;
+    __global float4 * o_row = (__global float4 *)(o_base + o_row_offset);
+
+    if (l_final > 0.0f) {
+        const float l_inv = 1.0f / l_final;
+        for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
+            local_o[tid] = o_acc[i];
+            barrier(CLK_LOCAL_MEM_FENCE);
+            #pragma unroll
+            for (int stride = LEGACY_ATTN_WG / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    local_o[tid] += local_o[tid + stride];
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            if (tid == 0) {
+                o_row[i] = local_o[0] * l_inv;
+            }
+        }
+    } else if (tid == 0) {
+        #pragma unroll
+        for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
+            o_row[i] = (float4)(0.0f);
+        }
+    }
+}
+)CLC";
+
+    backend_ctx->program_legacy_flash_attn_decode_f32_f16 =
+        try_build_program_from_source(
+            backend_ctx->context,
+            backend_ctx->device,
+            "legacy-flash-attn-decode",
+            legacy_flash_attn_decode_kernel,
+            compile_opts);
+
+    if (backend_ctx->program_legacy_flash_attn_decode_f32_f16 != nullptr) {
+        CL_CHECK((backend_ctx->kernel_legacy_flash_attn_decode_f32_f16 =
+            clCreateKernel(backend_ctx->program_legacy_flash_attn_decode_f32_f16,
+                "kernel_flash_attn_decode_f32_f16", &err), err));
+    }
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA decode attention kernel: %s\n",
+        backend_ctx->kernel_legacy_flash_attn_decode_f32_f16 != nullptr ? "true" : "false");
 
     static const char * q4_0_kernel = R"CLC(
 #define QK4_0 32
@@ -4595,7 +4855,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
 
     if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
-        GGML_LOG_WARN("ggml_opencl: NVIDIA legacy mode enabled; only Q4_0 x F32 matmul is supported\n");
+        GGML_LOG_WARN("ggml_opencl: NVIDIA legacy mode enabled; using narrow Qwen3 OpenCL 1.1 kernels\n");
         if (backend_ctx->legacy_trace) {
             GGML_LOG_INFO("ggml_opencl: legacy NVIDIA trace enabled via GGML_OPENCL_NVIDIA_LEGACY_TRACE\n");
         }
@@ -5753,6 +6013,63 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     ggml_opencl_legacy_trace_support(
                         backend_ctx, op, supported,
                         supported ? "f32-rope" : "f32-rope-predicate-failed");
+                    return supported;
+                }
+            case GGML_OP_FLASH_ATTN_EXT:
+                {
+                    const ggml_tensor * q     = op->src[0];
+                    const ggml_tensor * k     = op->src[1];
+                    const ggml_tensor * v     = op->src[2];
+                    const ggml_tensor * mask  = op->src[3];
+                    const ggml_tensor * sinks = op->src[4];
+                    const float * params      = (const float *) op->op_params;
+
+                    const bool have_srcs     = q != nullptr && k != nullptr && v != nullptr;
+                    const bool type_ok       = have_srcs &&
+                                               q->type == GGML_TYPE_F32 &&
+                                               k->type == GGML_TYPE_F16 &&
+                                               v->type == GGML_TYPE_F16 &&
+                                               op->type == GGML_TYPE_F32;
+                    const bool dims_ok       = have_srcs &&
+                                               q->ne[0] == 128 && v->ne[0] == 128 &&
+                                               k->ne[0] == q->ne[0] &&
+                                               q->ne[1] == 1 &&
+                                               q->ne[2] == 16 &&
+                                               k->ne[2] == 8 &&
+                                               v->ne[2] == k->ne[2] &&
+                                               k->ne[1] == v->ne[1] &&
+                                               k->ne[1] > 0 &&
+                                               k->ne[1] <= 128 &&
+                                               q->ne[3] == 1 &&
+                                               k->ne[3] == q->ne[3] &&
+                                               v->ne[3] == q->ne[3];
+                    const bool dst_shape_ok  = have_srcs &&
+                                               op->ne[0] == v->ne[0] &&
+                                               op->ne[1] == q->ne[2] &&
+                                               op->ne[2] == q->ne[1] &&
+                                               op->ne[3] == q->ne[3];
+                    const bool stride_ok     = have_srcs &&
+                                               q->nb[0] == ggml_type_size(q->type) &&
+                                               k->nb[0] == ggml_type_size(k->type) &&
+                                               v->nb[0] == ggml_type_size(v->type) &&
+                                               op->nb[0] == ggml_type_size(op->type);
+                    const bool mask_ok       = mask == nullptr ||
+                                               (have_srcs &&
+                                                mask->type == GGML_TYPE_F16 &&
+                                                mask->nb[0] == ggml_type_size(mask->type) &&
+                                                mask->ne[0] >= k->ne[1] &&
+                                                mask->ne[1] == q->ne[1] &&
+                                                q->ne[2] % mask->ne[2] == 0 &&
+                                                q->ne[3] % mask->ne[3] == 0);
+                    const bool params_ok     = params[1] == 0.0f && params[2] == 0.0f;
+                    const bool sinks_ok      = sinks == nullptr;
+                    const bool kernel_ok     = backend_ctx->kernel_legacy_flash_attn_decode_f32_f16 != nullptr;
+                    const bool supported     = type_ok && dims_ok && dst_shape_ok && stride_ok &&
+                                               mask_ok && params_ok && sinks_ok && kernel_ok;
+
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "f32-f16-flash-attn-decode" : "f32-f16-flash-attn-decode-predicate-failed");
                     return supported;
                 }
             case GGML_OP_MUL_MAT:
@@ -11429,6 +11746,118 @@ static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, NULL, dst);
 }
 
+static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    GGML_ASSERT(q->extra);
+    GGML_ASSERT(k->extra);
+    GGML_ASSERT(v->extra);
+    GGML_ASSERT(dst->extra);
+    if (mask) {
+        GGML_ASSERT(mask->extra);
+    }
+    GGML_ASSERT(sinks == nullptr);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const int n_q       = q->ne[1];
+    const int n_kv      = k->ne[1];
+    const int n_head    = q->ne[2];
+    const int n_head_kv = k->ne[2];
+
+    GGML_ASSERT(n_q == 1);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F16);
+    GGML_ASSERT(v->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(backend_ctx->kernel_legacy_flash_attn_decode_f32_f16 != nullptr);
+
+    ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *) q->extra;
+    ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *) k->extra;
+    ggml_tensor_extra_cl * extra_v = (ggml_tensor_extra_cl *) v->extra;
+    ggml_tensor_extra_cl * extra_o = (ggml_tensor_extra_cl *) dst->extra;
+    ggml_tensor_extra_cl * extra_mask = mask ? (ggml_tensor_extra_cl *) mask->extra : nullptr;
+
+    cl_ulong offset_q = extra_q->offset + q->view_offs;
+    cl_ulong offset_k = extra_k->offset + k->view_offs;
+    cl_ulong offset_v = extra_v->offset + v->view_offs;
+    cl_ulong offset_o = extra_o->offset + dst->view_offs;
+    cl_mem   mask_buffer = extra_mask ? extra_mask->data_device : nullptr;
+    cl_ulong offset_mask = extra_mask ? extra_mask->offset + mask->view_offs : 0;
+    cl_mem   sinks_buffer = nullptr;
+    cl_ulong offset_sinks = 0;
+
+    const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], q_nb3 = q->nb[3];
+    const cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
+    const cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
+    const cl_ulong o_nb1 = dst->nb[1], o_nb2 = dst->nb[2], o_nb3 = dst->nb[3];
+    const cl_ulong mask_nb1 = mask ? mask->nb[1] : 0;
+    const cl_ulong mask_nb2 = mask ? mask->nb[2] : 0;
+    const cl_ulong mask_nb3 = mask ? mask->nb[3] : 0;
+    const int mask_ne2 = mask ? mask->ne[2] : 0;
+    const int mask_ne3 = mask ? mask->ne[3] : 0;
+
+    const float * params = (const float *) dst->op_params;
+    const float scale         = params[0];
+    const float max_bias      = params[1];
+    const float logit_softcap = params[2];
+
+    const int is_causal = 0;
+    const int n_head_log2_val = n_head > 0 ? 1u << (int) floorf(log2f((float) n_head)) : 0;
+    const float n_head_log2_f = n_head_log2_val > 0 ? (float) n_head_log2_val : 1.0f;
+    const float m0 = powf(2.0f, -(max_bias) / n_head_log2_f);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2_f);
+
+    cl_kernel kernel = backend_ctx->kernel_legacy_flash_attn_decode_f32_f16;
+
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),    &extra_q->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong),  &offset_q));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),    &extra_k->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong),  &offset_k));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),    &extra_v->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong),  &offset_v));
+    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem),    &extra_o->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong),  &offset_o));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(float),     &scale));
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(int),       &n_q));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &n_kv));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &is_causal));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &n_head));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &q_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &q_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &q_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &k_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &k_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &k_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &v_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &v_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &v_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &o_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &o_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &o_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(float),    &max_bias));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(float),    &m0));
+    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(float),    &m1));
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(int),      &n_head_log2_val));
+    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(float),    &logit_softcap));
+    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(int),      &n_head_kv));
+    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(cl_mem),   &mask_buffer));
+    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(cl_ulong), &offset_mask));
+    CL_CHECK(clSetKernelArg(kernel, 33, sizeof(cl_ulong), &mask_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 34, sizeof(cl_ulong), &mask_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 35, sizeof(cl_ulong), &mask_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 36, sizeof(int),      &mask_ne2));
+    CL_CHECK(clSetKernelArg(kernel, 37, sizeof(int),      &mask_ne3));
+    CL_CHECK(clSetKernelArg(kernel, 38, sizeof(cl_mem),   &sinks_buffer));
+    CL_CHECK(clSetKernelArg(kernel, 39, sizeof(cl_ulong), &offset_sinks));
+
+    const size_t wg_size = 64;
+    size_t local_work_size[] = { wg_size, 1 };
+    size_t global_work_size[] = { wg_size, (size_t) (n_head * q->ne[3]) };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
@@ -11445,6 +11874,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        ggml_cl_legacy_flash_attn_decode_f32_f16(backend, q, k, dst);
+        return;
+    }
 
     const int n_q = q->ne[1];
     const int n_kv = k->ne[1];
