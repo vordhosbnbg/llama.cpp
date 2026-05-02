@@ -484,6 +484,21 @@ struct ggml_backend_opencl_context {
     uint64_t legacy_trace_d2h_bytes;
     uint64_t legacy_trace_sync_other_calls;
     uint64_t legacy_trace_finish_calls;
+    uint64_t legacy_trace_support_accepted_by_op[GGML_OP_COUNT];
+    uint64_t legacy_trace_support_rejected_by_op[GGML_OP_COUNT];
+    uint64_t legacy_trace_compute_nodes_by_op[GGML_OP_COUNT];
+    uint64_t legacy_trace_compute_failed_by_op[GGML_OP_COUNT];
+    uint64_t legacy_trace_compute_kernels_by_op[GGML_OP_COUNT];
+    uint64_t legacy_trace_support_accepted_by_unary[GGML_UNARY_OP_COUNT];
+    uint64_t legacy_trace_support_rejected_by_unary[GGML_UNARY_OP_COUNT];
+    uint64_t legacy_trace_compute_nodes_by_unary[GGML_UNARY_OP_COUNT];
+    uint64_t legacy_trace_compute_failed_by_unary[GGML_UNARY_OP_COUNT];
+    uint64_t legacy_trace_compute_kernels_by_unary[GGML_UNARY_OP_COUNT];
+    uint64_t legacy_trace_support_accepted_by_glu[GGML_GLU_OP_COUNT];
+    uint64_t legacy_trace_support_rejected_by_glu[GGML_GLU_OP_COUNT];
+    uint64_t legacy_trace_compute_nodes_by_glu[GGML_GLU_OP_COUNT];
+    uint64_t legacy_trace_compute_failed_by_glu[GGML_GLU_OP_COUNT];
+    uint64_t legacy_trace_compute_kernels_by_glu[GGML_GLU_OP_COUNT];
 
     cl_context context;
     cl_command_queue queue;
@@ -868,6 +883,134 @@ struct ggml_backend_opencl_context {
 // All registered devices with a default device in the front.
 static std::vector<ggml_backend_device> g_ggml_backend_opencl_devices;
 
+static int ggml_opencl_legacy_trace_op_id(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return -1;
+    }
+
+    const int op = (int) tensor->op;
+    return op >= 0 && op < (int) GGML_OP_COUNT ? op : -1;
+}
+
+static int ggml_opencl_legacy_trace_unary_id(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->op != GGML_OP_UNARY) {
+        return -1;
+    }
+
+    const int unary = (int) ggml_get_unary_op(tensor);
+    return unary >= 0 && unary < (int) GGML_UNARY_OP_COUNT ? unary : -1;
+}
+
+static int ggml_opencl_legacy_trace_glu_id(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->op != GGML_OP_GLU) {
+        return -1;
+    }
+
+    const int glu = (int) ggml_get_glu_op(tensor);
+    return glu >= 0 && glu < (int) GGML_GLU_OP_COUNT ? glu : -1;
+}
+
+static void ggml_opencl_legacy_trace_record_compute(
+        ggml_backend_opencl_context * ctx,
+        const ggml_tensor * tensor,
+        bool ok,
+        uint64_t kernel_delta) {
+    const int op = ggml_opencl_legacy_trace_op_id(tensor);
+    if (op >= 0) {
+        if (ok) {
+            ctx->legacy_trace_compute_nodes_by_op[op]++;
+            ctx->legacy_trace_compute_kernels_by_op[op] += kernel_delta;
+        } else {
+            ctx->legacy_trace_compute_failed_by_op[op]++;
+        }
+    }
+
+    const int unary = ggml_opencl_legacy_trace_unary_id(tensor);
+    if (unary >= 0) {
+        if (ok) {
+            ctx->legacy_trace_compute_nodes_by_unary[unary]++;
+            ctx->legacy_trace_compute_kernels_by_unary[unary] += kernel_delta;
+        } else {
+            ctx->legacy_trace_compute_failed_by_unary[unary]++;
+        }
+    }
+
+    const int glu = ggml_opencl_legacy_trace_glu_id(tensor);
+    if (glu >= 0) {
+        if (ok) {
+            ctx->legacy_trace_compute_nodes_by_glu[glu]++;
+            ctx->legacy_trace_compute_kernels_by_glu[glu] += kernel_delta;
+        } else {
+            ctx->legacy_trace_compute_failed_by_glu[glu]++;
+        }
+    }
+}
+
+static void ggml_opencl_legacy_trace_print_op_summary(const ggml_backend_opencl_context * ctx) {
+    for (int op = 0; op < (int) GGML_OP_COUNT; ++op) {
+        const uint64_t support_accepted = ctx->legacy_trace_support_accepted_by_op[op];
+        const uint64_t support_rejected = ctx->legacy_trace_support_rejected_by_op[op];
+        const uint64_t compute_nodes    = ctx->legacy_trace_compute_nodes_by_op[op];
+        const uint64_t compute_failed   = ctx->legacy_trace_compute_failed_by_op[op];
+        const uint64_t compute_kernels  = ctx->legacy_trace_compute_kernels_by_op[op];
+
+        if (support_accepted == 0 && support_rejected == 0 && compute_nodes == 0 && compute_failed == 0 && compute_kernels == 0) {
+            continue;
+        }
+
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace op-summary op=%s supports=[accepted=%" PRIu64 ",rejected=%" PRIu64 "] compute=[nodes=%" PRIu64 ",failed=%" PRIu64 ",kernels=%" PRIu64 "]\n",
+            ggml_op_name((enum ggml_op) op),
+            support_accepted,
+            support_rejected,
+            compute_nodes,
+            compute_failed,
+            compute_kernels);
+    }
+
+    for (int unary = 0; unary < (int) GGML_UNARY_OP_COUNT; ++unary) {
+        const uint64_t support_accepted = ctx->legacy_trace_support_accepted_by_unary[unary];
+        const uint64_t support_rejected = ctx->legacy_trace_support_rejected_by_unary[unary];
+        const uint64_t compute_nodes    = ctx->legacy_trace_compute_nodes_by_unary[unary];
+        const uint64_t compute_failed   = ctx->legacy_trace_compute_failed_by_unary[unary];
+        const uint64_t compute_kernels  = ctx->legacy_trace_compute_kernels_by_unary[unary];
+
+        if (support_accepted == 0 && support_rejected == 0 && compute_nodes == 0 && compute_failed == 0 && compute_kernels == 0) {
+            continue;
+        }
+
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace unary-summary op=%s supports=[accepted=%" PRIu64 ",rejected=%" PRIu64 "] compute=[nodes=%" PRIu64 ",failed=%" PRIu64 ",kernels=%" PRIu64 "]\n",
+            ggml_unary_op_name((enum ggml_unary_op) unary),
+            support_accepted,
+            support_rejected,
+            compute_nodes,
+            compute_failed,
+            compute_kernels);
+    }
+
+    for (int glu = 0; glu < (int) GGML_GLU_OP_COUNT; ++glu) {
+        const uint64_t support_accepted = ctx->legacy_trace_support_accepted_by_glu[glu];
+        const uint64_t support_rejected = ctx->legacy_trace_support_rejected_by_glu[glu];
+        const uint64_t compute_nodes    = ctx->legacy_trace_compute_nodes_by_glu[glu];
+        const uint64_t compute_failed   = ctx->legacy_trace_compute_failed_by_glu[glu];
+        const uint64_t compute_kernels  = ctx->legacy_trace_compute_kernels_by_glu[glu];
+
+        if (support_accepted == 0 && support_rejected == 0 && compute_nodes == 0 && compute_failed == 0 && compute_kernels == 0) {
+            continue;
+        }
+
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace glu-summary op=%s supports=[accepted=%" PRIu64 ",rejected=%" PRIu64 "] compute=[nodes=%" PRIu64 ",failed=%" PRIu64 ",kernels=%" PRIu64 "]\n",
+            ggml_glu_op_name((enum ggml_glu_op) glu),
+            support_accepted,
+            support_rejected,
+            compute_nodes,
+            compute_failed,
+            compute_kernels);
+    }
+}
+
 static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context * ctx) {
     if (ctx->gpu_family != GPU_FAMILY::NVIDIA_LEGACY) {
         return;
@@ -892,6 +1035,7 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
                 ctx->legacy_trace_d2h_bytes,
                 ctx->legacy_trace_sync_other_calls,
                 ctx->legacy_trace_finish_calls);
+            ggml_opencl_legacy_trace_print_op_summary(ctx);
         }
         if (ctx->legacy_trace) {
             ctx->legacy_trace_finish_calls++;
@@ -3581,6 +3725,21 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->legacy_trace_d2h_bytes = 0;
     backend_ctx->legacy_trace_sync_other_calls = 0;
     backend_ctx->legacy_trace_finish_calls = 0;
+    memset(backend_ctx->legacy_trace_support_accepted_by_op, 0, sizeof(backend_ctx->legacy_trace_support_accepted_by_op));
+    memset(backend_ctx->legacy_trace_support_rejected_by_op, 0, sizeof(backend_ctx->legacy_trace_support_rejected_by_op));
+    memset(backend_ctx->legacy_trace_compute_nodes_by_op, 0, sizeof(backend_ctx->legacy_trace_compute_nodes_by_op));
+    memset(backend_ctx->legacy_trace_compute_failed_by_op, 0, sizeof(backend_ctx->legacy_trace_compute_failed_by_op));
+    memset(backend_ctx->legacy_trace_compute_kernels_by_op, 0, sizeof(backend_ctx->legacy_trace_compute_kernels_by_op));
+    memset(backend_ctx->legacy_trace_support_accepted_by_unary, 0, sizeof(backend_ctx->legacy_trace_support_accepted_by_unary));
+    memset(backend_ctx->legacy_trace_support_rejected_by_unary, 0, sizeof(backend_ctx->legacy_trace_support_rejected_by_unary));
+    memset(backend_ctx->legacy_trace_compute_nodes_by_unary, 0, sizeof(backend_ctx->legacy_trace_compute_nodes_by_unary));
+    memset(backend_ctx->legacy_trace_compute_failed_by_unary, 0, sizeof(backend_ctx->legacy_trace_compute_failed_by_unary));
+    memset(backend_ctx->legacy_trace_compute_kernels_by_unary, 0, sizeof(backend_ctx->legacy_trace_compute_kernels_by_unary));
+    memset(backend_ctx->legacy_trace_support_accepted_by_glu, 0, sizeof(backend_ctx->legacy_trace_support_accepted_by_glu));
+    memset(backend_ctx->legacy_trace_support_rejected_by_glu, 0, sizeof(backend_ctx->legacy_trace_support_rejected_by_glu));
+    memset(backend_ctx->legacy_trace_compute_nodes_by_glu, 0, sizeof(backend_ctx->legacy_trace_compute_nodes_by_glu));
+    memset(backend_ctx->legacy_trace_compute_failed_by_glu, 0, sizeof(backend_ctx->legacy_trace_compute_failed_by_glu));
+    memset(backend_ctx->legacy_trace_compute_kernels_by_glu, 0, sizeof(backend_ctx->legacy_trace_compute_kernels_by_glu));
 
     // ref_count get increased in ggml_backend_opencl_device_init
     // This function is also used to retrieve backend context, so we don't want
@@ -4588,12 +4747,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         const uint64_t kernels_before = backend_ctx->legacy_trace_kernel_launches;
         bool ok = ggml_cl_compute_forward(backend, node);
         if (legacy_trace) {
+            const uint64_t kernel_delta = backend_ctx->legacy_trace_kernel_launches - kernels_before;
+            ggml_opencl_legacy_trace_record_compute(backend_ctx, node, ok, kernel_delta);
             GGML_LOG_INFO(
                 "ggml_opencl: legacy trace node result name=%s op=%s ok=%s kernel_delta=%" PRIu64 "\n",
                 ggml_opencl_tensor_name(node),
                 ggml_op_name(node->op),
                 ggml_opencl_bool(ok),
-                backend_ctx->legacy_trace_kernel_launches - kernels_before);
+                kernel_delta);
         }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -4636,13 +4797,41 @@ static void ggml_opencl_legacy_trace_support(
         backend_ctx->legacy_trace_support_rejected++;
     }
 
+    const int op_id = ggml_opencl_legacy_trace_op_id(op);
+    if (op_id >= 0) {
+        if (supported) {
+            backend_ctx->legacy_trace_support_accepted_by_op[op_id]++;
+        } else {
+            backend_ctx->legacy_trace_support_rejected_by_op[op_id]++;
+        }
+    }
+
+    const int unary_id = ggml_opencl_legacy_trace_unary_id(op);
+    if (unary_id >= 0) {
+        if (supported) {
+            backend_ctx->legacy_trace_support_accepted_by_unary[unary_id]++;
+        } else {
+            backend_ctx->legacy_trace_support_rejected_by_unary[unary_id]++;
+        }
+    }
+
+    const int glu_id = ggml_opencl_legacy_trace_glu_id(op);
+    if (glu_id >= 0) {
+        if (supported) {
+            backend_ctx->legacy_trace_support_accepted_by_glu[glu_id]++;
+        } else {
+            backend_ctx->legacy_trace_support_rejected_by_glu[glu_id]++;
+        }
+    }
+
     GGML_LOG_INFO(
-        "ggml_opencl: legacy trace supports_op #%" PRIu64 " supported=%s reason=%s name=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0=%s/%s/%s src1=%s/%s/%s totals=[accepted=%" PRIu64 ",rejected=%" PRIu64 "]\n",
+        "ggml_opencl: legacy trace supports_op #%" PRIu64 " supported=%s reason=%s name=%s op=%s desc=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0=%s/%s/%s src1=%s/%s/%s totals=[accepted=%" PRIu64 ",rejected=%" PRIu64 "]\n",
         backend_ctx->legacy_trace_support_queries,
         ggml_opencl_bool(supported),
         reason,
         ggml_opencl_tensor_name(op),
         op ? ggml_op_name(op->op) : "<none>",
+        op ? ggml_op_desc(op) : "<none>",
         op ? ggml_type_name(op->type) : "<none>",
         op ? op->ne[0] : 0, op ? op->ne[1] : 0, op ? op->ne[2] : 0, op ? op->ne[3] : 0,
         ggml_opencl_tensor_name(op ? op->src[0] : nullptr),
