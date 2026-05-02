@@ -1058,6 +1058,8 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
     cl_kernel * legacy_ops[] = {
         &ctx->kernel_add,
         &ctx->kernel_add_row,
+        &ctx->kernel_get_rows_f32,
+        &ctx->kernel_get_rows_q4_0,
         &ctx->kernel_mul,
         &ctx->kernel_mul_row,
         &ctx->kernel_rms_norm,
@@ -1224,6 +1226,98 @@ __kernel void ggml_legacy_half_storage(
     }
 
     static const char * f32_ops_kernel = R"CLC(
+#define QK4_0 32
+
+typedef uchar uint8_t;
+
+struct __attribute__((packed)) block_q4_0 {
+    half d;
+    uint8_t qs[QK4_0 / 2];
+};
+
+__kernel void kernel_get_rows_f32(
+        __global void * src0,
+        ulong offset0,
+        __global int * src1,
+        ulong offset1,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3) {
+    (void)ne10;
+
+    src0 = (__global void *)((__global char *)src0 + offset0);
+    src1 = (__global int *)((__global char *)src1 + offset1);
+    dst  = (__global float *)((__global char *)dst + offsetd);
+
+    const int i10 = get_group_id(0);
+    const int i11 = get_group_id(1);
+    const int i12 = get_group_id(2);
+    const int r = *(__global int *)((__global char *)src1 + (ulong)i12*nb12 + (ulong)i11*nb11 + (ulong)i10*nb10);
+
+    __global float * dst_row = (__global float *)((__global char *)dst +
+        (ulong)i12*nb3 + (ulong)i11*nb2 + (ulong)i10*nb1);
+    __global float * src_row = (__global float *)((__global char *)src0 +
+        (ulong)r*nb01 + (ulong)i11*nb02 + (ulong)i12*nb03);
+
+    for (int ind = get_local_id(0); ind < ne00; ind += get_local_size(0)) {
+        dst_row[ind] = src_row[ind];
+    }
+}
+
+__kernel void kernel_get_rows_q4_0(
+        __global void * src0,
+        ulong offset0,
+        __global int * src1,
+        ulong offset1,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3) {
+    (void)ne10;
+
+    src0 = (__global void *)((__global char *)src0 + offset0);
+    src1 = (__global int *)((__global char *)src1 + offset1);
+    dst  = (__global float *)((__global char *)dst + offsetd);
+
+    const int i10 = get_group_id(0);
+    const int i11 = get_group_id(1);
+    const int i12 = get_group_id(2);
+    const int r = *(__global int *)((__global char *)src1 + (ulong)i12*nb12 + (ulong)i11*nb11 + (ulong)i10*nb10);
+
+    __global float * dst_row = (__global float *)((__global char *)dst +
+        (ulong)i12*nb3 + (ulong)i11*nb2 + (ulong)i10*nb1);
+    __global const struct block_q4_0 * src_row = (__global const struct block_q4_0 *)(
+        (__global const char *)src0 + (ulong)r*nb01 + (ulong)i11*nb02 + (ulong)i12*nb03);
+
+    for (int ind = get_local_id(0); ind < ne00; ind += get_local_size(0)) {
+        const int ib = ind / QK4_0;
+        const int iq = ind - ib * QK4_0;
+        const uint8_t q = src_row[ib].qs[iq & (QK4_0 / 2 - 1)];
+        const int x = iq < QK4_0 / 2 ? (int)(q & 0x0F) : (int)(q >> 4);
+        const float d = vload_half(0, &src_row[ib].d);
+        dst_row[ind] = ((float)x - 8.0f) * d;
+    }
+}
+
 __kernel void kernel_add(
         __global char * src0,
         ulong offset0,
@@ -1657,6 +1751,10 @@ __kernel void kernel_rope_neox_f32(
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_add", &err), err));
     CL_CHECK((backend_ctx->kernel_add_row =
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_add_row", &err), err));
+    CL_CHECK((backend_ctx->kernel_get_rows_f32 =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_get_rows_f32", &err), err));
+    CL_CHECK((backend_ctx->kernel_get_rows_q4_0 =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_get_rows_q4_0", &err), err));
     CL_CHECK((backend_ctx->kernel_mul =
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_mul", &err), err));
     CL_CHECK((backend_ctx->kernel_mul_row =
@@ -5343,6 +5441,26 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             case GGML_OP_TRANSPOSE:
                 ggml_opencl_legacy_trace_support(backend_ctx, op, true, "metadata-op");
                 return true;
+            case GGML_OP_GET_ROWS:
+                {
+                    const bool have_srcs    = op->src[0] != nullptr && op->src[1] != nullptr;
+                    const bool src0_ok      = have_srcs &&
+                                              (op->src[0]->type == GGML_TYPE_F32 ||
+                                               op->src[0]->type == GGML_TYPE_Q4_0);
+                    const bool src1_i32     = have_srcs && op->src[1]->type == GGML_TYPE_I32;
+                    const bool dst_f32      = op->type == GGML_TYPE_F32;
+                    const bool block_ok     = !have_srcs || op->src[0]->type != GGML_TYPE_Q4_0 ||
+                                              op->src[0]->ne[0] % 32 == 0;
+                    const bool kernel_ok    = have_srcs && op->src[0]->type == GGML_TYPE_Q4_0 ?
+                                              backend_ctx->kernel_get_rows_q4_0 != nullptr :
+                                              backend_ctx->kernel_get_rows_f32 != nullptr;
+                    const bool supported    = src0_ok && src1_i32 && dst_f32 && block_ok && kernel_ok;
+
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "f32-get-rows" : "f32-get-rows-predicate-failed");
+                    return supported;
+                }
             case GGML_OP_ADD:
             case GGML_OP_MUL:
                 {
