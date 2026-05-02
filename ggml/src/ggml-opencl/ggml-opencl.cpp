@@ -522,6 +522,16 @@ struct ggml_backend_opencl_context {
     uint64_t legacy_trace_compute_nodes_by_glu[GGML_GLU_OP_COUNT];
     uint64_t legacy_trace_compute_failed_by_glu[GGML_GLU_OP_COUNT];
     uint64_t legacy_trace_compute_kernels_by_glu[GGML_GLU_OP_COUNT];
+    uint64_t legacy_trace_flash_attn_reject_count;
+    uint64_t legacy_trace_flash_attn_reject_type;
+    uint64_t legacy_trace_flash_attn_reject_dims;
+    uint64_t legacy_trace_flash_attn_reject_dst_shape;
+    uint64_t legacy_trace_flash_attn_reject_stride;
+    uint64_t legacy_trace_flash_attn_reject_mask;
+    uint64_t legacy_trace_flash_attn_reject_params;
+    uint64_t legacy_trace_flash_attn_reject_sinks;
+    uint64_t legacy_trace_flash_attn_reject_kernel;
+    std::string legacy_trace_flash_attn_last_reject;
 
     cl_context context;
     cl_command_queue queue;
@@ -1092,6 +1102,30 @@ static void ggml_opencl_legacy_trace_print_op_summary(const ggml_backend_opencl_
     }
 }
 
+static void ggml_opencl_legacy_trace_print_flash_attn_reject_summary(const ggml_backend_opencl_context * ctx) {
+    if (ctx->legacy_trace_flash_attn_reject_count == 0) {
+        return;
+    }
+
+    GGML_LOG_INFO(
+        "ggml_opencl: legacy trace flash-attn-reject-summary count=%" PRIu64 " false=[type=%" PRIu64 ",dims=%" PRIu64 ",dst_shape=%" PRIu64 ",stride=%" PRIu64 ",mask=%" PRIu64 ",params=%" PRIu64 ",sinks=%" PRIu64 ",kernel=%" PRIu64 "]\n",
+        ctx->legacy_trace_flash_attn_reject_count,
+        ctx->legacy_trace_flash_attn_reject_type,
+        ctx->legacy_trace_flash_attn_reject_dims,
+        ctx->legacy_trace_flash_attn_reject_dst_shape,
+        ctx->legacy_trace_flash_attn_reject_stride,
+        ctx->legacy_trace_flash_attn_reject_mask,
+        ctx->legacy_trace_flash_attn_reject_params,
+        ctx->legacy_trace_flash_attn_reject_sinks,
+        ctx->legacy_trace_flash_attn_reject_kernel);
+
+    if (!ctx->legacy_trace_flash_attn_last_reject.empty()) {
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy trace flash-attn-last-reject %s\n",
+            ctx->legacy_trace_flash_attn_last_reject.c_str());
+    }
+}
+
 static void ggml_opencl_legacy_trace_print_transfer_op_summary(
         const ggml_backend_opencl_context * ctx,
         bool h2d) {
@@ -1224,6 +1258,7 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
                 ctx->legacy_trace_sync_other_skipped_calls,
                 ctx->legacy_trace_finish_calls);
             ggml_opencl_legacy_trace_print_op_summary(ctx);
+            ggml_opencl_legacy_trace_print_flash_attn_reject_summary(ctx);
             ggml_opencl_legacy_trace_print_transfer_op_summary(ctx, true);
             ggml_opencl_legacy_trace_print_transfer_op_summary(ctx, false);
             ggml_opencl_legacy_trace_print_transfer_tensor_summary(ctx, true);
@@ -4787,6 +4822,16 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     memset(backend_ctx->legacy_trace_compute_nodes_by_glu, 0, sizeof(backend_ctx->legacy_trace_compute_nodes_by_glu));
     memset(backend_ctx->legacy_trace_compute_failed_by_glu, 0, sizeof(backend_ctx->legacy_trace_compute_failed_by_glu));
     memset(backend_ctx->legacy_trace_compute_kernels_by_glu, 0, sizeof(backend_ctx->legacy_trace_compute_kernels_by_glu));
+    backend_ctx->legacy_trace_flash_attn_reject_count = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_type = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_dims = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_dst_shape = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_stride = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_mask = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_params = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_sinks = 0;
+    backend_ctx->legacy_trace_flash_attn_reject_kernel = 0;
+    backend_ctx->legacy_trace_flash_attn_last_reject.clear();
 
     // ref_count get increased in ggml_backend_opencl_device_init
     // This function is also used to retrieve backend context, so we don't want
@@ -5908,6 +5953,71 @@ static void ggml_opencl_legacy_trace_support(
         backend_ctx->legacy_trace_support_rejected);
 }
 
+static void ggml_opencl_legacy_trace_record_flash_attn_reject(
+        ggml_backend_opencl_context * backend_ctx,
+        const ggml_tensor * op,
+        bool type_ok,
+        bool dims_ok,
+        bool dst_shape_ok,
+        bool stride_ok,
+        bool mask_ok,
+        bool params_ok,
+        bool sinks_ok,
+        bool kernel_ok) {
+    if (!backend_ctx->legacy_trace) {
+        return;
+    }
+
+    const ggml_tensor * q     = op ? op->src[0] : nullptr;
+    const ggml_tensor * k     = op ? op->src[1] : nullptr;
+    const ggml_tensor * v     = op ? op->src[2] : nullptr;
+    const ggml_tensor * mask  = op ? op->src[3] : nullptr;
+    const float * params      = op ? (const float *) op->op_params : nullptr;
+
+    backend_ctx->legacy_trace_flash_attn_reject_count++;
+    backend_ctx->legacy_trace_flash_attn_reject_type      += type_ok      ? 0 : 1;
+    backend_ctx->legacy_trace_flash_attn_reject_dims      += dims_ok      ? 0 : 1;
+    backend_ctx->legacy_trace_flash_attn_reject_dst_shape += dst_shape_ok ? 0 : 1;
+    backend_ctx->legacy_trace_flash_attn_reject_stride    += stride_ok    ? 0 : 1;
+    backend_ctx->legacy_trace_flash_attn_reject_mask      += mask_ok      ? 0 : 1;
+    backend_ctx->legacy_trace_flash_attn_reject_params    += params_ok    ? 0 : 1;
+    backend_ctx->legacy_trace_flash_attn_reject_sinks     += sinks_ok     ? 0 : 1;
+    backend_ctx->legacy_trace_flash_attn_reject_kernel    += kernel_ok    ? 0 : 1;
+
+    char detail[1536];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "type_ok=%s dims_ok=%s dst_shape_ok=%s stride_ok=%s mask_ok=%s params_ok=%s sinks_ok=%s kernel_ok=%s "
+        "q_type=%s k_type=%s v_type=%s mask_type=%s dst_type=%s "
+        "q_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "k_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "v_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "mask_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "dst_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "params=[%g,%g,%g]",
+        ggml_opencl_bool(type_ok),
+        ggml_opencl_bool(dims_ok),
+        ggml_opencl_bool(dst_shape_ok),
+        ggml_opencl_bool(stride_ok),
+        ggml_opencl_bool(mask_ok),
+        ggml_opencl_bool(params_ok),
+        ggml_opencl_bool(sinks_ok),
+        ggml_opencl_bool(kernel_ok),
+        q ? ggml_type_name(q->type) : "<none>",
+        k ? ggml_type_name(k->type) : "<none>",
+        v ? ggml_type_name(v->type) : "<none>",
+        mask ? ggml_type_name(mask->type) : "<none>",
+        op ? ggml_type_name(op->type) : "<none>",
+        q ? q->ne[0] : 0, q ? q->ne[1] : 0, q ? q->ne[2] : 0, q ? q->ne[3] : 0,
+        k ? k->ne[0] : 0, k ? k->ne[1] : 0, k ? k->ne[2] : 0, k ? k->ne[3] : 0,
+        v ? v->ne[0] : 0, v ? v->ne[1] : 0, v ? v->ne[2] : 0, v ? v->ne[3] : 0,
+        mask ? mask->ne[0] : 0, mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        op ? op->ne[0] : 0, op ? op->ne[1] : 0, op ? op->ne[2] : 0, op ? op->ne[3] : 0,
+        params ? params[0] : 0.0f, params ? params[1] : 0.0f, params ? params[2] : 0.0f);
+    backend_ctx->legacy_trace_flash_attn_last_reject = detail;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -6046,16 +6156,18 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     const bool kv_f32        = have_srcs && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32;
                     const bool type_ok       = q_f32 && (kv_f16 || kv_f32) && op->type == GGML_TYPE_F32;
                     const bool dims_ok       = have_srcs &&
-                                               q->ne[0] == 128 && v->ne[0] == 128 &&
+                                               q->ne[0] == 128 &&
                                                k->ne[0] == q->ne[0] &&
+                                               v->ne[0] == q->ne[0] &&
                                                q->ne[1] == 1 &&
-                                               q->ne[2] == 16 &&
-                                               k->ne[2] == 8 &&
+                                               q->ne[2] > 0 &&
+                                               k->ne[2] > 0 &&
+                                               q->ne[2] % k->ne[2] == 0 &&
                                                v->ne[2] == k->ne[2] &&
                                                k->ne[1] == v->ne[1] &&
                                                k->ne[1] > 0 &&
                                                k->ne[1] <= 128 &&
-                                               q->ne[3] == 1 &&
+                                               q->ne[3] > 0 &&
                                                k->ne[3] == q->ne[3] &&
                                                v->ne[3] == q->ne[3];
                     const bool dst_shape_ok  = have_srcs &&
@@ -6076,7 +6188,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                 mask_type_ok &&
                                                 mask->nb[0] == ggml_type_size(mask->type) &&
                                                 mask->ne[0] >= k->ne[1] &&
-                                                mask->ne[1] == q->ne[1] &&
+                                                mask->ne[1] >= q->ne[1] &&
+                                                mask->ne[2] > 0 &&
+                                                mask->ne[3] > 0 &&
                                                 q->ne[2] % mask->ne[2] == 0 &&
                                                 q->ne[3] % mask->ne[3] == 0);
                     const bool params_ok     = params[1] == 0.0f && params[2] == 0.0f;
@@ -6089,6 +6203,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         backend_ctx, op, supported,
                         supported ? "f32-kv-flash-attn-decode" : "f32-kv-flash-attn-decode-predicate-failed");
                     if (!supported && backend_ctx->legacy_trace) {
+                        ggml_opencl_legacy_trace_record_flash_attn_reject(
+                            backend_ctx, op, type_ok, dims_ok, dst_shape_ok, stride_ok,
+                            mask_ok, params_ok, sinks_ok, kernel_ok);
                         GGML_LOG_INFO(
                             "ggml_opencl: legacy NVIDIA rejects FLASH_ATTN_EXT decode: type_ok=%s dims_ok=%s dst_shape_ok=%s stride_ok=%s mask_ok=%s params_ok=%s sinks_ok=%s kernel_ok=%s "
                             "q_type=%s k_type=%s v_type=%s mask_type=%s dst_type=%s "
@@ -11815,6 +11932,8 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
     const int n_head_kv = k->ne[2];
 
     GGML_ASSERT(n_q == 1);
+    GGML_ASSERT(n_head_kv > 0);
+    GGML_ASSERT(n_head % n_head_kv == 0);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) ||
                 (k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32));
