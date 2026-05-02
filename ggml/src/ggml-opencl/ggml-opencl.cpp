@@ -1293,6 +1293,7 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
         &ctx->kernel_rope_norm_f32,
         &ctx->kernel_rope_neox_f32,
         &ctx->kernel_swiglu,
+        &ctx->kernel_set_rows_f16_i64,
         &ctx->kernel_legacy_flash_attn_decode_f32_f16,
     };
     for (cl_kernel * kernel : legacy_ops) {
@@ -1822,6 +1823,50 @@ __kernel void kernel_swiglu(
     }
 }
 
+__kernel void kernel_set_rows_f16_i64(
+        __global char * src0,
+        ulong offset0,
+        __global char * src1,
+        ulong offset1,
+        __global char * dst,
+        ulong offsetd,
+        int ne01,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        uint4 ne11,
+        uint4 ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        int nblk0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3) {
+    src0 += offset0;
+    src1 += offset1;
+    dst  += offsetd;
+
+    const int i03 = get_group_id(2);
+    const int i02 = get_group_id(1);
+    const int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    const int i12 = i03 - (i03 / ne12.s2) * ne12.s2;
+    const int i11 = i02 - (i02 / ne11.s2) * ne11.s2;
+    const long i1 = *(__global long *)(src1 + (ulong)i01*nb10 + (ulong)i11*nb11 + (ulong)i12*nb12);
+
+    __global const float * src_row = (__global const float *)(src0 + (ulong)i01*nb01 + (ulong)i02*nb02 + (ulong)i03*nb03);
+    __global char * dst_row = dst + (ulong)i1*nb1 + (ulong)i02*nb2 + (ulong)i03*nb3;
+
+    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
+        vstore_half(src_row[ind], 0, (__global half *)(dst_row + (ulong)ind * 2));
+    }
+}
+
 float ggml_legacy_rope_yarn_ramp(float low, float high, int i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -2038,6 +2083,8 @@ __kernel void kernel_rope_neox_f32(
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_rope_neox_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_swiglu =
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_swiglu", &err), err));
+    CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_set_rows_f16_i64", &err), err));
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA F32 op kernels: true\n");
 
     static const char * legacy_flash_attn_decode_kernel = R"CLC(
@@ -6064,6 +6111,35 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     ggml_opencl_legacy_trace_support(
                         backend_ctx, op, supported,
                         supported ? "f32-get-rows" : "f32-get-rows-predicate-failed");
+                    return supported;
+                }
+            case GGML_OP_SET_ROWS:
+                {
+                    const bool have_srcs    = op->src[0] != nullptr &&
+                                              op->src[1] != nullptr &&
+                                              op->src[2] != nullptr;
+                    const bool src0_f32     = have_srcs && op->src[0]->type == GGML_TYPE_F32;
+                    const bool src1_i64     = have_srcs && op->src[1]->type == GGML_TYPE_I64;
+                    const bool src2_f16     = have_srcs && op->src[2]->type == GGML_TYPE_F16;
+                    const bool dst_f16      = op->type == GGML_TYPE_F16;
+                    const bool shape_ok     = have_srcs &&
+                                              op->ne[0] == op->src[0]->ne[0] &&
+                                              op->ne[2] == op->src[0]->ne[2] &&
+                                              op->ne[3] == op->src[0]->ne[3] &&
+                                              op->src[0]->ne[1] == op->src[1]->ne[0] &&
+                                              op->src[0]->ne[2] % op->src[1]->ne[1] == 0 &&
+                                              op->src[0]->ne[3] % op->src[1]->ne[2] == 0 &&
+                                              op->src[1]->ne[3] == 1;
+                    const bool rows_ok      = have_srcs &&
+                                              ggml_is_contiguous_rows(op->src[0]) &&
+                                              ggml_is_contiguous_rows(op);
+                    const bool kernel_ok    = backend_ctx->kernel_set_rows_f16_i64 != nullptr;
+                    const bool supported    = src0_f32 && src1_i64 && src2_f16 && dst_f16 &&
+                                              shape_ok && rows_ok && kernel_ok;
+
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "f32-i64-to-f16-set-rows" : "f32-i64-to-f16-set-rows-predicate-failed");
                     return supported;
                 }
             case GGML_OP_ADD:
