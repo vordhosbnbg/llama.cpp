@@ -367,8 +367,27 @@ static bool ggml_opencl_env_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 && strcmp(value, "false") != 0;
 }
 
+static int ggml_opencl_env_int(const char * name, int default_value) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < INT32_MIN || parsed > INT32_MAX) {
+        GGML_LOG_WARN("ggml_opencl: ignoring invalid integer env %s=%s\n", name, value);
+        return default_value;
+    }
+    return (int) parsed;
+}
+
 static const char * ggml_opencl_bool(bool value) {
     return value ? "true" : "false";
+}
+
+static bool ggml_opencl_is_power_of_two(size_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
 }
 
 static const char * ggml_opencl_tensor_name(const ggml_tensor * tensor) {
@@ -519,6 +538,7 @@ struct ggml_backend_opencl_context {
     bool legacy_half_storage_support;
     bool legacy_trace;
     bool legacy_profile;
+    int legacy_q4_0_mul_mat_lws;
 
     uint64_t legacy_trace_graphs;
     uint64_t legacy_trace_nodes;
@@ -863,7 +883,13 @@ struct ggml_backend_opencl_context {
         return workgroup_size;
     }
 
-    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+    void enqueue_ndrange_kernel(
+            cl_kernel kernel,
+            cl_uint work_dim,
+            size_t * global_work_size,
+            size_t * local_work_size,
+            const ggml_tensor * tensor,
+            const char * profile_kernel_name = nullptr) {
         if (gpu_family == GPU_FAMILY::NVIDIA_LEGACY && legacy_trace) {
             legacy_trace_kernel_launches++;
 
@@ -900,8 +926,11 @@ struct ggml_backend_opencl_context {
         }
         if (legacy_profile_kernel && evt != nullptr) {
             char kernel_name[128];
-            ggml_opencl_get_kernel_name(kernel, kernel_name, sizeof(kernel_name));
-            ggml_opencl_legacy_profile_record_event(this, evt, tensor, "kernel", kernel_name, 0);
+            if (profile_kernel_name == nullptr) {
+                ggml_opencl_get_kernel_name(kernel, kernel_name, sizeof(kernel_name));
+                profile_kernel_name = kernel_name;
+            }
+            ggml_opencl_legacy_profile_record_event(this, evt, tensor, "kernel", profile_kernel_name, 0);
             CL_CHECK(clRetainEvent(evt));
         }
         profiling_info.emplace_back();
@@ -915,8 +944,11 @@ struct ggml_backend_opencl_context {
         }
         if (legacy_profile_kernel && evt != nullptr) {
             char kernel_name[128];
-            ggml_opencl_get_kernel_name(kernel, kernel_name, sizeof(kernel_name));
-            ggml_opencl_legacy_profile_record_event(this, evt, tensor, "kernel", kernel_name, 0);
+            if (profile_kernel_name == nullptr) {
+                ggml_opencl_get_kernel_name(kernel, kernel_name, sizeof(kernel_name));
+                profile_kernel_name = kernel_name;
+            }
+            ggml_opencl_legacy_profile_record_event(this, evt, tensor, "kernel", profile_kernel_name, 0);
         }
 #endif
     }
@@ -1327,6 +1359,29 @@ static void ggml_opencl_legacy_profile_print_summary(ggml_backend_opencl_context
 
     ctx->legacy_profile_events.clear();
     ctx->legacy_profile_host_stats.clear();
+}
+
+static size_t ggml_opencl_legacy_q4_0_mul_mat_lws(ggml_backend_opencl_context * ctx, int ne00) {
+    const size_t max_legacy_lws = 128;
+    const size_t min_legacy_lws = 16;
+
+    if (ctx->legacy_q4_0_mul_mat_lws > 0) {
+        return (size_t) ctx->legacy_q4_0_mul_mat_lws;
+    }
+
+    const size_t nb = ne00 > 0 ? (size_t) ne00 / 32 : 0;
+    size_t lws = min_legacy_lws;
+    // Each work item consumes q4 blocks in a strided loop. Use the largest
+    // useful power of two so narrow Qwen matrices avoid idle reduction lanes.
+    while (2 * lws <= nb && 2 * lws <= max_legacy_lws) {
+        lws *= 2;
+    }
+
+    while (lws > ctx->max_workgroup_size && lws > min_legacy_lws) {
+        lws >>= 1;
+    }
+
+    return lws;
 }
 
 static void ggml_opencl_legacy_trace_record_compute(
@@ -5174,6 +5229,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->legacy_half_storage_support = false;
     backend_ctx->legacy_trace = ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_TRACE");
     backend_ctx->legacy_profile = ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_PROFILE");
+    backend_ctx->legacy_q4_0_mul_mat_lws =
+        ggml_opencl_env_int("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_LWS", 0);
     backend_ctx->legacy_trace_graphs = 0;
     backend_ctx->legacy_trace_nodes = 0;
     backend_ctx->legacy_trace_support_queries = 0;
@@ -5331,6 +5388,24 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
         clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &backend_ctx->max_workgroup_size, NULL);
         GGML_LOG_INFO("ggml_opencl: device max workgroup size: %lu\n", backend_ctx->max_workgroup_size);
+
+        if (backend_ctx->legacy_q4_0_mul_mat_lws != 0 &&
+                (backend_ctx->legacy_q4_0_mul_mat_lws < 16 ||
+                 !ggml_opencl_is_power_of_two((size_t) backend_ctx->legacy_q4_0_mul_mat_lws) ||
+                 (size_t) backend_ctx->legacy_q4_0_mul_mat_lws > backend_ctx->max_workgroup_size)) {
+            GGML_LOG_WARN(
+                "ggml_opencl: ignoring invalid legacy Q4_0 matmul local size %d; using auto\n",
+                backend_ctx->legacy_q4_0_mul_mat_lws);
+            backend_ctx->legacy_q4_0_mul_mat_lws = 0;
+        }
+
+        if (backend_ctx->legacy_q4_0_mul_mat_lws == 0) {
+            GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 matmul local size: auto\n");
+        } else {
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy NVIDIA Q4_0 matmul local size: override:%d\n",
+                backend_ctx->legacy_q4_0_mul_mat_lws);
+        }
 
         cl_int err;
         cl_command_queue_properties command_queue_props = 0;
@@ -14127,7 +14202,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         cl_kernel legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32;
         GGML_ASSERT(legacy_kernel != nullptr);
 
-        const size_t local_size = 128;
+        const size_t local_size = ggml_opencl_legacy_q4_0_mul_mat_lws(backend_ctx, ne00);
+        char profile_kernel_name[128];
+        snprintf(
+            profile_kernel_name,
+            sizeof(profile_kernel_name),
+            "ggml_legacy_mul_mat_q4_0_f32_lws%zu_k%d_rows%d_cols%d",
+            local_size,
+            ne00,
+            ne01,
+            ne11);
 
         CL_CHECK(clSetKernelArg(legacy_kernel,  0, sizeof(cl_mem),   &extra0->data_device));
         CL_CHECK(clSetKernelArg(legacy_kernel,  1, sizeof(cl_ulong), &offset0));
@@ -14165,7 +14249,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         };
         size_t local_work_size[] = {local_size, 1, 1};
 
-        backend_ctx->enqueue_ndrange_kernel(legacy_kernel, 3, global_work_size, local_work_size, dst);
+        backend_ctx->enqueue_ndrange_kernel(legacy_kernel, 3, global_work_size, local_work_size, dst, profile_kernel_name);
         return;
     }
 
