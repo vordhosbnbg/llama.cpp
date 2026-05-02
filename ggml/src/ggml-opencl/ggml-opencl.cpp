@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -30,6 +31,7 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+#include <utility>
 
 #undef MIN
 #undef MAX
@@ -433,6 +435,38 @@ struct ggml_opencl_legacy_trace_op_transfer_stat {
     uint64_t bytes = 0;
 };
 
+struct ggml_opencl_legacy_profile_event {
+    cl_event evt = nullptr;
+    int op_id = -1;
+    std::string kind;
+    std::string name;
+    size_t bytes = 0;
+};
+
+struct ggml_opencl_legacy_profile_stat {
+    uint64_t count = 0;
+    uint64_t bytes = 0;
+    uint64_t queued_ns = 0;
+    uint64_t submit_wait_ns = 0;
+    uint64_t exec_ns = 0;
+    uint64_t total_ns = 0;
+};
+
+static void ggml_opencl_legacy_profile_record_event(
+        ggml_backend_opencl_context * ctx,
+        cl_event evt,
+        const ggml_tensor * tensor,
+        const char * kind,
+        const char * name,
+        size_t bytes);
+static uint64_t ggml_opencl_legacy_profile_now_ns();
+static void ggml_opencl_legacy_profile_record_host(
+        ggml_backend_opencl_context * ctx,
+        const char * kind,
+        const char * name,
+        size_t bytes,
+        uint64_t elapsed_ns);
+
 // backend device context
 struct ggml_backend_opencl_device_context {
     cl_platform_id platform;
@@ -484,6 +518,7 @@ struct ggml_backend_opencl_context {
     bool legacy_probe_only;
     bool legacy_half_storage_support;
     bool legacy_trace;
+    bool legacy_profile;
 
     uint64_t legacy_trace_graphs;
     uint64_t legacy_trace_nodes;
@@ -532,6 +567,8 @@ struct ggml_backend_opencl_context {
     uint64_t legacy_trace_flash_attn_reject_sinks;
     uint64_t legacy_trace_flash_attn_reject_kernel;
     std::string legacy_trace_flash_attn_last_reject;
+    std::vector<ggml_opencl_legacy_profile_event> legacy_profile_events;
+    std::map<std::string, ggml_opencl_legacy_profile_stat> legacy_profile_host_stats;
 
     cl_context context;
     cl_command_queue queue;
@@ -850,14 +887,37 @@ struct ggml_backend_opencl_context {
                 lws[0], lws[1], lws[2]);
         }
 
-#ifdef GGML_OPENCL_PROFILING
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        const bool legacy_profile_kernel = gpu_family == GPU_FAMILY::NVIDIA_LEGACY && legacy_profile;
 
+        cl_event evt = nullptr;
+        const uint64_t legacy_profile_host_start = legacy_profile_kernel ? ggml_opencl_legacy_profile_now_ns() : 0;
+#ifdef GGML_OPENCL_PROFILING
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        if (legacy_profile_kernel) {
+            ggml_opencl_legacy_profile_record_host(
+                this, "enqueue-kernel", tensor ? ggml_op_name(tensor->op) : "NONE", 0,
+                ggml_opencl_legacy_profile_now_ns() - legacy_profile_host_start);
+        }
+        if (legacy_profile_kernel && evt != nullptr) {
+            char kernel_name[128];
+            ggml_opencl_get_kernel_name(kernel, kernel_name, sizeof(kernel_name));
+            ggml_opencl_legacy_profile_record_event(this, evt, tensor, "kernel", kernel_name, 0);
+            CL_CHECK(clRetainEvent(evt));
+        }
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
 #else
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, legacy_profile_kernel ? &evt : NULL));
+        if (legacy_profile_kernel) {
+            ggml_opencl_legacy_profile_record_host(
+                this, "enqueue-kernel", tensor ? ggml_op_name(tensor->op) : "NONE", 0,
+                ggml_opencl_legacy_profile_now_ns() - legacy_profile_host_start);
+        }
+        if (legacy_profile_kernel && evt != nullptr) {
+            char kernel_name[128];
+            ggml_opencl_get_kernel_name(kernel, kernel_name, sizeof(kernel_name));
+            ggml_opencl_legacy_profile_record_event(this, evt, tensor, "kernel", kernel_name, 0);
+        }
 #endif
     }
 
@@ -999,6 +1059,274 @@ static uint64_t ggml_opencl_legacy_trace_record_finish(
     ctx->legacy_trace_finish_calls++;
     ctx->legacy_trace_finish_by_reason[reason]++;
     return ctx->legacy_trace_finish_calls;
+}
+
+static void ggml_opencl_legacy_profile_record_event(
+        ggml_backend_opencl_context * ctx,
+        cl_event evt,
+        const ggml_tensor * tensor,
+        const char * kind,
+        const char * name,
+        size_t bytes) {
+    if (ctx == nullptr || !ctx->legacy_profile || evt == nullptr) {
+        return;
+    }
+
+    ggml_opencl_legacy_profile_event event;
+    event.evt   = evt;
+    event.op_id = ggml_opencl_legacy_trace_op_id(tensor);
+    event.kind  = kind != nullptr ? kind : "<none>";
+    event.name  = name != nullptr ? name : "<none>";
+    event.bytes = bytes;
+    ctx->legacy_profile_events.push_back(std::move(event));
+}
+
+static uint64_t ggml_opencl_legacy_profile_now_ns() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void ggml_opencl_legacy_profile_record_host(
+        ggml_backend_opencl_context * ctx,
+        const char * kind,
+        const char * name,
+        size_t bytes,
+        uint64_t elapsed_ns) {
+    if (ctx == nullptr || !ctx->legacy_profile) {
+        return;
+    }
+
+    const std::string key = std::string(kind != nullptr ? kind : "<none>") + "|" + (name != nullptr ? name : "<none>");
+    ggml_opencl_legacy_profile_stat & stat = ctx->legacy_profile_host_stats[key];
+    stat.count++;
+    stat.bytes += bytes;
+    stat.exec_ns += elapsed_ns;
+    stat.total_ns += elapsed_ns;
+}
+
+static bool ggml_opencl_legacy_profile_event_times(
+        const ggml_opencl_legacy_profile_event & event,
+        uint64_t & queued_ns,
+        uint64_t & submit_wait_ns,
+        uint64_t & exec_ns,
+        uint64_t & total_ns) {
+    cl_ulong queued = 0;
+    cl_ulong submit = 0;
+    cl_ulong start  = 0;
+    cl_ulong end    = 0;
+
+    cl_int err = clWaitForEvents(1, &event.evt);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: legacy profile failed waiting for event kind=%s name=%s err=%d\n",
+            event.kind.c_str(), event.name.c_str(), err);
+        return false;
+    }
+
+    err = clGetEventProfilingInfo(event.evt, CL_PROFILING_COMMAND_QUEUED, sizeof(cl_ulong), &queued, nullptr);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: legacy profile missing queued time kind=%s name=%s err=%d\n",
+            event.kind.c_str(), event.name.c_str(), err);
+        return false;
+    }
+    err = clGetEventProfilingInfo(event.evt, CL_PROFILING_COMMAND_SUBMIT, sizeof(cl_ulong), &submit, nullptr);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: legacy profile missing submit time kind=%s name=%s err=%d\n",
+            event.kind.c_str(), event.name.c_str(), err);
+        return false;
+    }
+    err = clGetEventProfilingInfo(event.evt, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &start, nullptr);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: legacy profile missing start time kind=%s name=%s err=%d\n",
+            event.kind.c_str(), event.name.c_str(), err);
+        return false;
+    }
+    err = clGetEventProfilingInfo(event.evt, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end, nullptr);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: legacy profile missing end time kind=%s name=%s err=%d\n",
+            event.kind.c_str(), event.name.c_str(), err);
+        return false;
+    }
+
+    queued_ns      = submit >= queued ? submit - queued : 0;
+    submit_wait_ns = start  >= submit ? start  - submit : 0;
+    exec_ns        = end    >= start  ? end    - start  : 0;
+    total_ns       = end    >= queued ? end    - queued : 0;
+    return true;
+}
+
+static void ggml_opencl_legacy_profile_accumulate(
+        ggml_opencl_legacy_profile_stat & stat,
+        const ggml_opencl_legacy_profile_event & event,
+        uint64_t queued_ns,
+        uint64_t submit_wait_ns,
+        uint64_t exec_ns,
+        uint64_t total_ns) {
+    stat.count++;
+    stat.bytes += event.bytes;
+    stat.queued_ns += queued_ns;
+    stat.submit_wait_ns += submit_wait_ns;
+    stat.exec_ns += exec_ns;
+    stat.total_ns += total_ns;
+}
+
+static double ggml_opencl_legacy_profile_ms(uint64_t ns) {
+    return (double) ns / 1.0e6;
+}
+
+static double ggml_opencl_legacy_profile_avg_us(uint64_t ns, uint64_t count) {
+    return count == 0 ? 0.0 : (double) ns / (double) count / 1.0e3;
+}
+
+static void ggml_opencl_legacy_profile_print_stats(
+        const char * label,
+        const char * key_name,
+        const std::vector<std::pair<std::string, ggml_opencl_legacy_profile_stat>> & stats,
+        size_t limit) {
+    const size_t n = limit == 0 ? stats.size() : std::min(limit, stats.size());
+    uint64_t omitted_count = 0;
+    uint64_t omitted_bytes = 0;
+    uint64_t omitted_exec_ns = 0;
+
+    for (size_t i = 0; i < stats.size(); ++i) {
+        const auto & entry = stats[i];
+        const ggml_opencl_legacy_profile_stat & stat = entry.second;
+        if (i >= n) {
+            omitted_count += stat.count;
+            omitted_bytes += stat.bytes;
+            omitted_exec_ns += stat.exec_ns;
+            continue;
+        }
+
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy profile %s %s=%s count=%" PRIu64 " bytes=%" PRIu64 " queued_ms=%.3f submit_wait_ms=%.3f exec_ms=%.3f total_ms=%.3f avg_exec_us=%.3f\n",
+            label,
+            key_name,
+            entry.first.c_str(),
+            stat.count,
+            stat.bytes,
+            ggml_opencl_legacy_profile_ms(stat.queued_ns),
+            ggml_opencl_legacy_profile_ms(stat.submit_wait_ns),
+            ggml_opencl_legacy_profile_ms(stat.exec_ns),
+            ggml_opencl_legacy_profile_ms(stat.total_ns),
+            ggml_opencl_legacy_profile_avg_us(stat.exec_ns, stat.count));
+    }
+
+    if (stats.size() > n) {
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy profile %s omitted=%zu count=%" PRIu64 " bytes=%" PRIu64 " exec_ms=%.3f\n",
+            label,
+            stats.size() - n,
+            omitted_count,
+            omitted_bytes,
+            ggml_opencl_legacy_profile_ms(omitted_exec_ns));
+    }
+}
+
+static void ggml_opencl_legacy_profile_print_summary(ggml_backend_opencl_context * ctx) {
+    if (ctx == nullptr || !ctx->legacy_profile) {
+        return;
+    }
+
+    std::map<std::string, ggml_opencl_legacy_profile_stat> by_kind;
+    std::map<std::string, ggml_opencl_legacy_profile_stat> by_kernel;
+    std::map<std::string, ggml_opencl_legacy_profile_stat> by_transfer;
+    ggml_opencl_legacy_profile_stat by_kernel_op[GGML_OP_COUNT];
+
+    uint64_t measured = 0;
+    uint64_t skipped = 0;
+
+    for (ggml_opencl_legacy_profile_event & event : ctx->legacy_profile_events) {
+        uint64_t queued_ns = 0;
+        uint64_t submit_wait_ns = 0;
+        uint64_t exec_ns = 0;
+        uint64_t total_ns = 0;
+        if (!ggml_opencl_legacy_profile_event_times(event, queued_ns, submit_wait_ns, exec_ns, total_ns)) {
+            skipped++;
+            if (event.evt != nullptr) {
+                clReleaseEvent(event.evt);
+                event.evt = nullptr;
+            }
+            continue;
+        }
+
+        ggml_opencl_legacy_profile_accumulate(by_kind[event.kind], event, queued_ns, submit_wait_ns, exec_ns, total_ns);
+
+        if (event.kind == "kernel") {
+            ggml_opencl_legacy_profile_accumulate(by_kernel[event.name], event, queued_ns, submit_wait_ns, exec_ns, total_ns);
+            if (event.op_id >= 0 && event.op_id < (int) GGML_OP_COUNT) {
+                ggml_opencl_legacy_profile_accumulate(by_kernel_op[event.op_id], event, queued_ns, submit_wait_ns, exec_ns, total_ns);
+            }
+        } else if (event.kind == "h2d" || event.kind == "d2h" || event.kind == "clear") {
+            ggml_opencl_legacy_profile_accumulate(by_transfer[event.kind + "|" + event.name], event, queued_ns, submit_wait_ns, exec_ns, total_ns);
+        }
+
+        measured++;
+        if (event.evt != nullptr) {
+            clReleaseEvent(event.evt);
+            event.evt = nullptr;
+        }
+    }
+
+    GGML_LOG_INFO(
+        "ggml_opencl: legacy profile final summary events=%zu measured=%" PRIu64 " skipped=%" PRIu64 "\n",
+        ctx->legacy_profile_events.size(),
+        measured,
+        skipped);
+
+    std::vector<std::pair<std::string, ggml_opencl_legacy_profile_stat>> kind_stats(by_kind.begin(), by_kind.end());
+    std::sort(kind_stats.begin(), kind_stats.end(), [](const auto & a, const auto & b) {
+        if (a.second.exec_ns != b.second.exec_ns) {
+            return a.second.exec_ns > b.second.exec_ns;
+        }
+        return a.first < b.first;
+    });
+    ggml_opencl_legacy_profile_print_stats("kind-summary", "kind", kind_stats, 0);
+
+    std::vector<std::pair<std::string, ggml_opencl_legacy_profile_stat>> op_stats;
+    for (int op = 0; op < (int) GGML_OP_COUNT; ++op) {
+        if (by_kernel_op[op].count == 0) {
+            continue;
+        }
+        op_stats.emplace_back(ggml_op_name((enum ggml_op) op), by_kernel_op[op]);
+    }
+    std::sort(op_stats.begin(), op_stats.end(), [](const auto & a, const auto & b) {
+        if (a.second.exec_ns != b.second.exec_ns) {
+            return a.second.exec_ns > b.second.exec_ns;
+        }
+        return a.first < b.first;
+    });
+    ggml_opencl_legacy_profile_print_stats("op-summary", "op", op_stats, 0);
+
+    std::vector<std::pair<std::string, ggml_opencl_legacy_profile_stat>> kernel_stats(by_kernel.begin(), by_kernel.end());
+    std::sort(kernel_stats.begin(), kernel_stats.end(), [](const auto & a, const auto & b) {
+        if (a.second.exec_ns != b.second.exec_ns) {
+            return a.second.exec_ns > b.second.exec_ns;
+        }
+        return a.first < b.first;
+    });
+    ggml_opencl_legacy_profile_print_stats("kernel-summary", "kernel", kernel_stats, 16);
+
+    std::vector<std::pair<std::string, ggml_opencl_legacy_profile_stat>> transfer_stats(by_transfer.begin(), by_transfer.end());
+    std::sort(transfer_stats.begin(), transfer_stats.end(), [](const auto & a, const auto & b) {
+        if (a.second.exec_ns != b.second.exec_ns) {
+            return a.second.exec_ns > b.second.exec_ns;
+        }
+        return a.first < b.first;
+    });
+    ggml_opencl_legacy_profile_print_stats("transfer-summary", "key", transfer_stats, 0);
+
+    std::vector<std::pair<std::string, ggml_opencl_legacy_profile_stat>> host_stats(
+        ctx->legacy_profile_host_stats.begin(), ctx->legacy_profile_host_stats.end());
+    std::sort(host_stats.begin(), host_stats.end(), [](const auto & a, const auto & b) {
+        if (a.second.exec_ns != b.second.exec_ns) {
+            return a.second.exec_ns > b.second.exec_ns;
+        }
+        return a.first < b.first;
+    });
+    ggml_opencl_legacy_profile_print_stats("host-summary", "key", host_stats, 0);
+
+    ctx->legacy_profile_events.clear();
+    ctx->legacy_profile_host_stats.clear();
 }
 
 static void ggml_opencl_legacy_trace_record_compute(
@@ -1272,6 +1600,14 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
                 finish_id);
         }
         clFinish(ctx->queue);
+    }
+
+    if (ctx->legacy_profile && ctx->queue != nullptr) {
+        cl_int err = clFinish(ctx->queue);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: legacy NVIDIA clFinish failed before profile summary: %d\n", err);
+        }
+        ggml_opencl_legacy_profile_print_summary(ctx);
     }
 
     if (ctx->kernel_legacy_mul_mat_q4_0_f32 != nullptr) {
@@ -4837,6 +5173,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->legacy_probe_only = false;
     backend_ctx->legacy_half_storage_support = false;
     backend_ctx->legacy_trace = ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_TRACE");
+    backend_ctx->legacy_profile = ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_PROFILE");
     backend_ctx->legacy_trace_graphs = 0;
     backend_ctx->legacy_trace_nodes = 0;
     backend_ctx->legacy_trace_support_queries = 0;
@@ -4884,6 +5221,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->legacy_trace_flash_attn_reject_sinks = 0;
     backend_ctx->legacy_trace_flash_attn_reject_kernel = 0;
     backend_ctx->legacy_trace_flash_attn_last_reject.clear();
+    backend_ctx->legacy_profile_events.clear();
+    backend_ctx->legacy_profile_host_stats.clear();
 
     // ref_count get increased in ggml_backend_opencl_device_init
     // This function is also used to retrieve backend context, so we don't want
@@ -4972,6 +5311,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         if (backend_ctx->legacy_trace) {
             GGML_LOG_INFO("ggml_opencl: legacy NVIDIA trace enabled via GGML_OPENCL_NVIDIA_LEGACY_TRACE\n");
         }
+        if (backend_ctx->legacy_profile) {
+            GGML_LOG_INFO("ggml_opencl: legacy NVIDIA profiling enabled via GGML_OPENCL_NVIDIA_LEGACY_PROFILE\n");
+        }
 
         cl_uint base_align_in_bits;
         CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
@@ -4995,6 +5337,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #ifdef GGML_OPENCL_PROFILING
         command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
+        if (backend_ctx->legacy_profile) {
+            command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
+        }
         CL_CHECK((backend_ctx->queue = clCreateCommandQueue(dev_ctx->context, device, command_queue_props, &err), err));
 
         backend_ctx->context = dev_ctx->context;
@@ -5677,7 +6022,13 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
                 "ggml_opencl: legacy trace clFinish #%" PRIu64 " reason=synchronize\n",
                 finish_id);
         }
+        const uint64_t legacy_profile_host_start = backend_ctx->legacy_profile ? ggml_opencl_legacy_profile_now_ns() : 0;
         cl_int err = clFinish(backend_ctx->queue);
+        if (backend_ctx->legacy_profile) {
+            ggml_opencl_legacy_profile_record_host(
+                backend_ctx, "finish", "synchronize", 0,
+                ggml_opencl_legacy_profile_now_ns() - legacy_profile_host_start);
+        }
         if (err != CL_SUCCESS) {
             GGML_LOG_WARN("ggml_opencl: legacy NVIDIA clFinish failed during synchronize: %d\n", err);
         }
@@ -7111,9 +7462,19 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 backend_ctx->legacy_trace_h2d_bytes);
         }
 
+        cl_event evt = nullptr;
+        const uint64_t legacy_profile_host_start = backend_ctx->legacy_profile ? ggml_opencl_legacy_profile_now_ns() : 0;
         CL_CHECK(clEnqueueWriteBuffer(
             queue, extra->data_device, CL_TRUE, extra->offset + offset,
-            size, data, 0, NULL, NULL));
+            size, data, 0, NULL, backend_ctx->legacy_profile ? &evt : NULL));
+        if (backend_ctx->legacy_profile) {
+            ggml_opencl_legacy_profile_record_host(
+                backend_ctx, "enqueue-h2d", ggml_op_name(tensor->op), size,
+                ggml_opencl_legacy_profile_now_ns() - legacy_profile_host_start);
+        }
+        if (backend_ctx->legacy_profile && evt != nullptr) {
+            ggml_opencl_legacy_profile_record_event(backend_ctx, evt, tensor, "h2d", ggml_op_name(tensor->op), size);
+        }
 
         GGML_UNUSED(buffer);
         return;
@@ -8087,9 +8448,19 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
                 backend_ctx->legacy_trace_d2h_bytes);
         }
 
+        cl_event evt = nullptr;
+        const uint64_t legacy_profile_host_start = backend_ctx->legacy_profile ? ggml_opencl_legacy_profile_now_ns() : 0;
         CL_CHECK(clEnqueueReadBuffer(
             queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
-            size, data, 0, NULL, NULL));
+            size, data, 0, NULL, backend_ctx->legacy_profile ? &evt : NULL));
+        if (backend_ctx->legacy_profile) {
+            ggml_opencl_legacy_profile_record_host(
+                backend_ctx, "enqueue-d2h", ggml_op_name(tensor->op), size,
+                ggml_opencl_legacy_profile_now_ns() - legacy_profile_host_start);
+        }
+        if (backend_ctx->legacy_profile && evt != nullptr) {
+            ggml_opencl_legacy_profile_record_event(backend_ctx, evt, tensor, "d2h", ggml_op_name(tensor->op), size);
+        }
 
         GGML_UNUSED(context);
         GGML_UNUSED(buffer);
@@ -8746,7 +9117,18 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
             size_t offset = 0;
             while (offset < buffer->size) {
                 const size_t size = std::min(clear_chunk.size(), buffer->size - offset);
-                CL_CHECK(clEnqueueWriteBuffer(queue, buf, CL_FALSE, offset, size, clear_chunk.data(), 0, NULL, NULL));
+                cl_event evt = nullptr;
+                const uint64_t legacy_profile_host_start = backend_ctx->legacy_profile ? ggml_opencl_legacy_profile_now_ns() : 0;
+                CL_CHECK(clEnqueueWriteBuffer(queue, buf, CL_FALSE, offset, size, clear_chunk.data(), 0, NULL,
+                    backend_ctx->legacy_profile ? &evt : NULL));
+                if (backend_ctx->legacy_profile) {
+                    ggml_opencl_legacy_profile_record_host(
+                        backend_ctx, "enqueue-clear", "buffer-clear", size,
+                        ggml_opencl_legacy_profile_now_ns() - legacy_profile_host_start);
+                }
+                if (backend_ctx->legacy_profile && evt != nullptr) {
+                    ggml_opencl_legacy_profile_record_event(backend_ctx, evt, nullptr, "clear", "buffer-clear", size);
+                }
                 offset += size;
             }
         }
@@ -8762,7 +9144,16 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
             finish_id,
             buffer->size);
     }
-    CL_CHECK(clFinish(queue));
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY && backend_ctx->legacy_profile) {
+        const uint64_t legacy_profile_host_start = ggml_opencl_legacy_profile_now_ns();
+        cl_int err = clFinish(queue);
+        ggml_opencl_legacy_profile_record_host(
+            backend_ctx, "finish", "buffer-clear", 0,
+            ggml_opencl_legacy_profile_now_ns() - legacy_profile_host_start);
+        CL_CHECK(err);
+    } else {
+        CL_CHECK(clFinish(queue));
+    }
 }
 
 static void ggml_backend_opencl_buffer_reset(ggml_backend_buffer_t buffer) {
