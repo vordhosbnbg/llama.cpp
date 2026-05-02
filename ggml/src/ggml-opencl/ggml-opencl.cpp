@@ -1061,6 +1061,8 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
         &ctx->kernel_mul,
         &ctx->kernel_mul_row,
         &ctx->kernel_rms_norm,
+        &ctx->kernel_rope_norm_f32,
+        &ctx->kernel_rope_neox_f32,
         &ctx->kernel_swiglu,
     };
     for (cl_kernel * kernel : legacy_ops) {
@@ -1455,6 +1457,196 @@ __kernel void kernel_swiglu(
         dst_row[i0] = silu * x1;
     }
 }
+
+float ggml_legacy_rope_yarn_ramp(float low, float high, int i0) {
+    const float y = (i0 / 2 - low) / max(0.001f, high - low);
+    return 1.0f - min(1.0f, max(0.0f, y));
+}
+
+float2 ggml_legacy_rope_yarn(
+        float theta_extrap,
+        float freq_scale,
+        float2 corr_dims,
+        int i0,
+        float ext_factor,
+        float mscale) {
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix = ggml_legacy_rope_yarn_ramp(corr_dims.s0, corr_dims.s1, i0) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
+    }
+    return (float2)(cos(theta) * mscale, sin(theta) * mscale);
+}
+
+float ggml_legacy_rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, float base) {
+    return n_dims * log(n_ctx_orig / (n_rot * 6.283185307179586476925286766559f)) / (2.0f * log(base));
+}
+
+float2 ggml_legacy_rope_yarn_corr_dims(
+        int n_dims,
+        int n_ctx_orig,
+        float freq_base,
+        float beta_fast,
+        float beta_slow) {
+    return (float2)(
+        max(0.0f, floor(ggml_legacy_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base))),
+        min(n_dims - 1.0f, ceil(ggml_legacy_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base))));
+}
+
+__kernel void kernel_rope_norm_f32(
+        __global void * src0,
+        ulong offset0,
+        __global int * src1,
+        ulong offset1,
+        __global float * src2,
+        ulong offset2,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int n_past,
+        int n_dims,
+        int n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    (void)ne00; (void)ne01; (void)ne02; (void)ne03;
+    (void)ne1; (void)ne2; (void)ne3; (void)n_past;
+
+    src0 = (__global void *)((__global char *)src0 + offset0);
+    src1 = (__global int *)((__global char *)src1 + offset1);
+    src2 = (__global float *)((__global char *)src2 + offset2);
+    dst  = (__global float *)((__global char *)dst + offsetd);
+
+    const int i3 = get_group_id(2);
+    const int i2 = get_group_id(1);
+    const int i1 = get_group_id(0);
+
+    const float2 corr_dims = ggml_legacy_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow);
+    const float theta_base = (float)src1[i2];
+    const float inv_ndims = -1.0f / n_dims;
+
+    for (int i0 = 2 * get_local_id(0); i0 < ne0; i0 += 2 * get_local_size(0)) {
+        __global float * src = (__global float *)((__global char *)src0 +
+            (ulong)i3*nb03 + (ulong)i2*nb02 + (ulong)i1*nb01 + (ulong)i0*nb00);
+        __global float * dst_data = (__global float *)((__global char *)dst +
+            (ulong)i3*nb3 + (ulong)i2*nb2 + (ulong)i1*nb1 + (ulong)i0*nb0);
+
+        if (i0 < n_dims) {
+            const int ic = i0 / 2;
+            const float theta = theta_base * pow(freq_base, inv_ndims * i0);
+            const float freq_factor = src2 != (__global float *)src0 ? src2[ic] : 1.0f;
+            const float2 cos_sin_theta =
+                ggml_legacy_rope_yarn(theta / freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor);
+
+            const float x0 = src[0];
+            const float x1 = src[1];
+            dst_data[0] = x0 * cos_sin_theta.s0 - x1 * cos_sin_theta.s1;
+            dst_data[1] = x0 * cos_sin_theta.s1 + x1 * cos_sin_theta.s0;
+        } else {
+            dst_data[0] = src[0];
+            dst_data[1] = src[1];
+        }
+    }
+}
+
+__kernel void kernel_rope_neox_f32(
+        __global void * src0,
+        ulong offset0,
+        __global int * src1,
+        ulong offset1,
+        __global float * src2,
+        ulong offset2,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int n_past,
+        int n_dims,
+        int n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    (void)ne00; (void)ne01; (void)ne02; (void)ne03;
+    (void)ne1; (void)ne2; (void)ne3; (void)n_past;
+
+    src0 = (__global void *)((__global char *)src0 + offset0);
+    src1 = (__global int *)((__global char *)src1 + offset1);
+    src2 = (__global float *)((__global char *)src2 + offset2);
+    dst  = (__global float *)((__global char *)dst + offsetd);
+
+    const int i3 = get_group_id(2);
+    const int i2 = get_group_id(1);
+    const int i1 = get_group_id(0);
+
+    const float2 corr_dims = ggml_legacy_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow);
+    const float theta_base = (float)src1[i2];
+    const float inv_ndims = -1.0f / n_dims;
+
+    for (int i0 = 2 * get_local_id(0); i0 < ne0; i0 += 2 * get_local_size(0)) {
+        if (i0 < n_dims) {
+            const int ic = i0 / 2;
+            const float theta = theta_base * pow(freq_base, inv_ndims * i0);
+            const float freq_factor = src2 != (__global float *)src0 ? src2[ic] : 1.0f;
+            const float2 cos_sin_theta =
+                ggml_legacy_rope_yarn(theta / freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor);
+
+            __global float * src = (__global float *)((__global char *)src0 +
+                (ulong)i3*nb03 + (ulong)i2*nb02 + (ulong)i1*nb01 + (ulong)ic*nb00);
+            __global float * dst_data = (__global float *)((__global char *)dst +
+                (ulong)i3*nb3 + (ulong)i2*nb2 + (ulong)i1*nb1 + (ulong)ic*nb0);
+
+            const float x0 = src[0];
+            const float x1 = src[n_dims / 2];
+            dst_data[0] = x0 * cos_sin_theta.s0 - x1 * cos_sin_theta.s1;
+            dst_data[n_dims / 2] = x0 * cos_sin_theta.s1 + x1 * cos_sin_theta.s0;
+        } else {
+            __global float * src = (__global float *)((__global char *)src0 +
+                (ulong)i3*nb03 + (ulong)i2*nb02 + (ulong)i1*nb01 + (ulong)i0*nb00);
+            __global float * dst_data = (__global float *)((__global char *)dst +
+                (ulong)i3*nb3 + (ulong)i2*nb2 + (ulong)i1*nb1 + (ulong)i0*nb0);
+
+            dst_data[0] = src[0];
+            dst_data[1] = src[1];
+        }
+    }
+}
 )CLC";
 
     backend_ctx->program_legacy_ops_f32 =
@@ -1471,6 +1663,10 @@ __kernel void kernel_swiglu(
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_mul_row", &err), err));
     CL_CHECK((backend_ctx->kernel_rms_norm =
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_rms_norm", &err), err));
+    CL_CHECK((backend_ctx->kernel_rope_norm_f32 =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_rope_norm_f32", &err), err));
+    CL_CHECK((backend_ctx->kernel_rope_neox_f32 =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_rope_neox_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_swiglu =
         clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_swiglu", &err), err));
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA F32 op kernels: true\n");
@@ -5201,6 +5397,30 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     ggml_opencl_legacy_trace_support(
                         backend_ctx, op, supported,
                         supported ? "f32-swiglu" : "f32-swiglu-predicate-failed");
+                    return supported;
+                }
+            case GGML_OP_ROPE:
+                {
+                    const int mode           = ((const int32_t *) op->op_params)[2];
+                    const bool is_neox       = mode & 2;
+                    const bool is_mrope      = mode & GGML_ROPE_TYPE_MROPE;
+                    const bool is_vision     = mode == GGML_ROPE_TYPE_VISION;
+                    const bool have_src0     = op->src[0] != nullptr;
+                    const bool have_src1     = op->src[1] != nullptr;
+                    const bool src0_f32      = have_src0 && op->src[0]->type == GGML_TYPE_F32;
+                    const bool src1_i32      = have_src1 && op->src[1]->type == GGML_TYPE_I32;
+                    const bool src2_ok       = op->src[2] == nullptr || op->src[2]->type == GGML_TYPE_F32;
+                    const bool dst_f32       = op->type == GGML_TYPE_F32;
+                    const bool mode_ok       = !is_mrope && !is_vision;
+                    const bool kernel_ok     = is_neox ?
+                                               backend_ctx->kernel_rope_neox_f32 != nullptr :
+                                               backend_ctx->kernel_rope_norm_f32 != nullptr;
+                    const bool supported     = src0_f32 && src1_i32 && src2_ok && dst_f32 &&
+                                               mode_ok && kernel_ok;
+
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "f32-rope" : "f32-rope-predicate-failed");
                     return supported;
                 }
             case GGML_OP_MUL_MAT:
