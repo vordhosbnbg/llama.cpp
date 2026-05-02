@@ -2115,14 +2115,15 @@ __kernel void kernel_flash_attn_decode_f32_f16(
         ulong sinks_offset,
         int kv_is_f16,
         int mask_is_f16) {
-    (void)n_q; (void)is_causal; (void)o_nb2; (void)mask_nb1;
+    (void)is_causal;
     (void)max_bias; (void)m0; (void)m1; (void)n_head_log2;
     (void)logit_softcap; (void)sinks_void; (void)sinks_offset;
 
     const int tid = get_local_id(0);
-    const int head_batch_idx = get_global_id(1);
-    const int batch_idx = head_batch_idx / n_head;
-    const int head_idx = head_batch_idx - batch_idx * n_head;
+    const int head_idx = get_global_id(1);
+    const int query_batch_idx = get_global_id(2);
+    const int batch_idx = query_batch_idx / n_q;
+    const int query_idx = query_batch_idx - batch_idx * n_q;
     const int gqa_ratio = n_head / n_head_kv;
     const int head_kv_idx = head_idx / gqa_ratio;
 
@@ -2136,10 +2137,13 @@ __kernel void kernel_flash_attn_decode_f32_f16(
         const int mask_head_idx = head_idx % mask_ne2;
         const int mask_batch_idx = batch_idx % mask_ne3;
         mask_base = (__global const char *)mask_void + mask_offset +
-            (ulong)mask_batch_idx * mask_nb3 + (ulong)mask_head_idx * mask_nb2;
+            (ulong)mask_batch_idx * mask_nb3 +
+            (ulong)mask_head_idx * mask_nb2 +
+            (ulong)query_idx * mask_nb1;
     }
 
-    const ulong q_row_offset = (ulong)batch_idx * q_nb3 + (ulong)head_idx * q_nb2;
+    const ulong q_row_offset =
+        (ulong)batch_idx * q_nb3 + (ulong)head_idx * q_nb2 + (ulong)query_idx * q_nb1;
     __global const float4 * q_row = (__global const float4 *)(q_base + q_row_offset);
 
     float4 q_priv[LEGACY_ATTN_VEC];
@@ -2226,7 +2230,8 @@ __kernel void kernel_flash_attn_decode_f32_f16(
     }
 
     const float l_final = local_l[0];
-    const ulong o_row_offset = (ulong)batch_idx * o_nb3 + (ulong)head_idx * o_nb1;
+    const ulong o_row_offset =
+        (ulong)batch_idx * o_nb3 + (ulong)query_idx * o_nb2 + (ulong)head_idx * o_nb1;
     __global float4 * o_row = (__global float4 *)(o_base + o_row_offset);
 
     if (l_final > 0.0f) {
@@ -6159,7 +6164,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                q->ne[0] == 128 &&
                                                k->ne[0] == q->ne[0] &&
                                                v->ne[0] == q->ne[0] &&
-                                               q->ne[1] == 1 &&
+                                               q->ne[1] > 0 &&
+                                               q->ne[1] <= 16 &&
                                                q->ne[2] > 0 &&
                                                k->ne[2] > 0 &&
                                                q->ne[2] % k->ne[2] == 0 &&
@@ -11931,7 +11937,8 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
     const int n_head    = q->ne[2];
     const int n_head_kv = k->ne[2];
 
-    GGML_ASSERT(n_q == 1);
+    GGML_ASSERT(n_q > 0);
+    GGML_ASSERT(n_q <= 16);
     GGML_ASSERT(n_kv <= 256);
     GGML_ASSERT(n_head_kv > 0);
     GGML_ASSERT(n_head % n_head_kv == 0);
@@ -12025,9 +12032,9 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
     CL_CHECK(clSetKernelArg(kernel, 41, sizeof(int),      &mask_is_f16));
 
     const size_t wg_size = 64;
-    size_t local_work_size[] = { wg_size, 1 };
-    size_t global_work_size[] = { wg_size, (size_t) (n_head * q->ne[3]) };
-    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+    size_t local_work_size[] = { wg_size, 1, 1 };
+    size_t global_work_size[] = { wg_size, (size_t) n_head, (size_t) (n_q * q->ne[3]) };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
