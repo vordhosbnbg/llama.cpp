@@ -1370,11 +1370,17 @@ static size_t ggml_opencl_legacy_q4_0_mul_mat_lws(ggml_backend_opencl_context * 
     }
 
     const size_t nb = ne00 > 0 ? (size_t) ne00 / 32 : 0;
+    // Measured on GT 540M with Qwen3 0.6B Q4_0:
+    //   K=1024 is best at 32 lanes, K=2048 at 64 lanes, K=3072 at 128 lanes.
+    // The K=3072 case benefits from the larger reduction group despite some
+    // idle lanes, so this is not simply the largest non-idle power of two.
     size_t lws = min_legacy_lws;
-    // Each work item consumes q4 blocks in a strided loop. Use the largest
-    // useful power of two so narrow Qwen matrices avoid idle reduction lanes.
-    while (2 * lws <= nb && 2 * lws <= max_legacy_lws) {
-        lws *= 2;
+    if (nb >= 96) {
+        lws = 128;
+    } else if (nb >= 64) {
+        lws = 64;
+    } else if (nb >= 32) {
+        lws = 32;
     }
 
     while (lws > ctx->max_workgroup_size && lws > min_legacy_lws) {
