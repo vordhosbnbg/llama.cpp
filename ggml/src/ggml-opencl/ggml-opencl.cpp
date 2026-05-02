@@ -574,6 +574,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mm_f16_f32_l4_lm;
     cl_program program_mul_mm_q8_0_f32_l4_lm;
     cl_program program_legacy_mul_mat_q4_0_f32;
+    cl_program program_legacy_ops_f32;
 
     cl_kernel kernel_add, kernel_add_row, kernel_add_f16, kernel_add_row_f16;
     cl_kernel kernel_mul, kernel_mul_row, kernel_mul_f16, kernel_mul_row_f16;
@@ -1054,12 +1055,38 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
         ctx->kernel_legacy_mul_mat_q4_0_f32 = nullptr;
     }
 
+    cl_kernel * legacy_ops[] = {
+        &ctx->kernel_add,
+        &ctx->kernel_add_row,
+        &ctx->kernel_mul,
+        &ctx->kernel_mul_row,
+        &ctx->kernel_rms_norm,
+        &ctx->kernel_swiglu,
+    };
+    for (cl_kernel * kernel : legacy_ops) {
+        if (*kernel != nullptr) {
+            cl_int err = clReleaseKernel(*kernel);
+            if (err != CL_SUCCESS) {
+                GGML_LOG_WARN("ggml_opencl: failed to release legacy F32 op kernel: %d\n", err);
+            }
+            *kernel = nullptr;
+        }
+    }
+
     if (ctx->program_legacy_mul_mat_q4_0_f32 != nullptr) {
         cl_int err = clReleaseProgram(ctx->program_legacy_mul_mat_q4_0_f32);
         if (err != CL_SUCCESS) {
             GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 program: %d\n", err);
         }
         ctx->program_legacy_mul_mat_q4_0_f32 = nullptr;
+    }
+
+    if (ctx->program_legacy_ops_f32 != nullptr) {
+        cl_int err = clReleaseProgram(ctx->program_legacy_ops_f32);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy F32 op program: %d\n", err);
+        }
+        ctx->program_legacy_ops_f32 = nullptr;
     }
 }
 
@@ -1194,6 +1221,260 @@ __kernel void ggml_legacy_half_storage(
         return false;
     }
 
+    static const char * f32_ops_kernel = R"CLC(
+__kernel void kernel_add(
+        __global char * src0,
+        ulong offset0,
+        __global char * src1,
+        ulong offset1,
+        __global char * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        int ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3) {
+    (void)ne00; (void)ne01; (void)ne02; (void)ne03;
+    (void)ne1; (void)ne2; (void)ne3;
+
+    src0 += offset0;
+    src1 += offset1;
+    dst  += offsetd;
+
+    const int i03 = get_group_id(2);
+    const int i02 = get_group_id(1);
+    const int i01 = get_group_id(0);
+
+    const int i13 = i03 % ne13;
+    const int i12 = i02 % ne12;
+    const int i11 = i01 % ne11;
+
+    __global char * src0_ptr = src0 + (ulong)i03*nb03 + (ulong)i02*nb02 + (ulong)i01*nb01;
+    __global char * src1_ptr = src1 + (ulong)i13*nb13 + (ulong)i12*nb12 + (ulong)i11*nb11;
+    __global char * dst_ptr  = dst  + (ulong)i03*nb3  + (ulong)i02*nb2  + (ulong)i01*nb1;
+
+    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const int i10 = i0 % ne10;
+        const float a = *(__global float *)(src0_ptr + (ulong)i0*nb00);
+        const float b = *(__global float *)(src1_ptr + (ulong)i10*nb10);
+        *(__global float *)(dst_ptr + (ulong)i0*nb0) = a + b;
+    }
+}
+
+__kernel void kernel_add_row(
+        __global float4 * src0,
+        ulong offset0,
+        __global float4 * src1,
+        ulong offset1,
+        __global float4 * dst,
+        ulong offsetd,
+        int ne) {
+    src0 = (__global float4 *)((__global char *)src0 + offset0);
+    src1 = (__global float4 *)((__global char *)src1 + offset1);
+    dst  = (__global float4 *)((__global char *)dst  + offsetd);
+
+    const uint gid = get_global_id(0);
+    const uint idx1 = gid - (gid / ne) * ne;
+    dst[gid] = src0[gid] + src1[idx1];
+}
+
+__kernel void kernel_mul(
+        __global char * src0,
+        ulong offset0,
+        __global char * src1,
+        ulong offset1,
+        __global char * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        int ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3) {
+    (void)ne00; (void)ne01; (void)ne02; (void)ne03;
+    (void)ne1; (void)ne2; (void)ne3;
+
+    src0 += offset0;
+    src1 += offset1;
+    dst  += offsetd;
+
+    const int i03 = get_group_id(2);
+    const int i02 = get_group_id(1);
+    const int i01 = get_group_id(0);
+
+    const int i13 = i03 % ne13;
+    const int i12 = i02 % ne12;
+    const int i11 = i01 % ne11;
+
+    __global char * src0_ptr = src0 + (ulong)i03*nb03 + (ulong)i02*nb02 + (ulong)i01*nb01;
+    __global char * src1_ptr = src1 + (ulong)i13*nb13 + (ulong)i12*nb12 + (ulong)i11*nb11;
+    __global char * dst_ptr  = dst  + (ulong)i03*nb3  + (ulong)i02*nb2  + (ulong)i01*nb1;
+
+    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const int i10 = i0 % ne10;
+        const float a = *(__global float *)(src0_ptr + (ulong)i0*nb00);
+        const float b = *(__global float *)(src1_ptr + (ulong)i10*nb10);
+        *(__global float *)(dst_ptr + (ulong)i0*nb0) = a * b;
+    }
+}
+
+__kernel void kernel_mul_row(
+        __global float4 * src0,
+        ulong offset0,
+        __global float4 * src1,
+        ulong offset1,
+        __global float4 * dst,
+        ulong offsetd,
+        int ne) {
+    src0 = (__global float4 *)((__global char *)src0 + offset0);
+    src1 = (__global float4 *)((__global char *)src1 + offset1);
+    dst  = (__global float4 *)((__global char *)dst  + offsetd);
+
+    const uint gid = get_global_id(0);
+    const uint idx1 = gid - (gid / ne) * ne;
+    dst[gid] = src0[gid] * src1[idx1];
+}
+
+__kernel void kernel_rms_norm(
+        __global void * src0,
+        ulong offset0,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        float eps,
+        __local float * sum) {
+    (void)ne01; (void)ne02; (void)ne03;
+
+    __global char * src = (__global char *)src0 + offset0;
+    dst = (__global float *)((__global char *)dst + offsetd);
+
+    const int i03 = get_group_id(2);
+    const int i02 = get_group_id(1);
+    const int i01 = get_group_id(0);
+    const int tid = get_local_id(0);
+    const int local_size = get_local_size(0);
+
+    __global float * x = (__global float *)(src + (ulong)i03*nb03 + (ulong)i02*nb02 + (ulong)i01*nb01);
+
+    float thread_sum = 0.0f;
+    for (int i = tid; i < ne00; i += local_size) {
+        const float v = x[i];
+        thread_sum += v * v;
+    }
+
+    sum[tid] = thread_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum[tid] += sum[tid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid == 0) {
+        sum[0] = 1.0f / sqrt(sum[0] / (float)ne00 + eps);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const float scale = sum[0];
+    __global float * y = dst + ((ulong)i03*ne02*ne01 + (ulong)i02*ne01 + (ulong)i01) * (ulong)ne00;
+    for (int i = tid; i < ne00; i += local_size) {
+        y[i] = x[i] * scale;
+    }
+}
+
+__kernel void kernel_swiglu(
+        __global char * src0,
+        ulong offset0,
+        __global char * src1,
+        ulong offset1,
+        __global char * dst,
+        ulong offsetd,
+        ulong nb01,
+        ulong nb11,
+        int ne0,
+        ulong nb1,
+        int ne00_off,
+        int ne10_off) {
+    src0 += offset0;
+    src1 += offset1;
+    dst  += offsetd;
+
+    __global float * src0_row = (__global float *)(src0 + (ulong)get_group_id(0)*nb01) + ne00_off;
+    __global float * src1_row = (__global float *)(src1 + (ulong)get_group_id(0)*nb11) + ne10_off;
+    __global float * dst_row  = (__global float *)(dst  + (ulong)get_group_id(0)*nb1);
+
+    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+        const float silu = x0 / (1.0f + exp(-x0));
+        dst_row[i0] = silu * x1;
+    }
+}
+)CLC";
+
+    backend_ctx->program_legacy_ops_f32 =
+        build_program_from_source(backend_ctx->context, backend_ctx->device, f32_ops_kernel, compile_opts);
+
+    cl_int err;
+    CL_CHECK((backend_ctx->kernel_add =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_add", &err), err));
+    CL_CHECK((backend_ctx->kernel_add_row =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_add_row", &err), err));
+    CL_CHECK((backend_ctx->kernel_mul =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_mul", &err), err));
+    CL_CHECK((backend_ctx->kernel_mul_row =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_mul_row", &err), err));
+    CL_CHECK((backend_ctx->kernel_rms_norm =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_rms_norm", &err), err));
+    CL_CHECK((backend_ctx->kernel_swiglu =
+        clCreateKernel(backend_ctx->program_legacy_ops_f32, "kernel_swiglu", &err), err));
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA F32 op kernels: true\n");
+
     static const char * q4_0_kernel = R"CLC(
 #define QK4_0 32
 
@@ -1287,7 +1568,6 @@ __kernel void ggml_legacy_mul_mat_q4_0_f32(
     backend_ctx->program_legacy_mul_mat_q4_0_f32 =
         build_program_from_source(backend_ctx->context, backend_ctx->device, q4_0_kernel, compile_opts);
 
-    cl_int err;
     CL_CHECK((backend_ctx->kernel_legacy_mul_mat_q4_0_f32 =
         clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32, "ggml_legacy_mul_mat_q4_0_f32", &err), err));
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 matmul kernel: true\n");
@@ -4867,6 +5147,62 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             case GGML_OP_TRANSPOSE:
                 ggml_opencl_legacy_trace_support(backend_ctx, op, true, "metadata-op");
                 return true;
+            case GGML_OP_ADD:
+            case GGML_OP_MUL:
+                {
+                    const bool have_srcs  = op->src[0] != nullptr && op->src[1] != nullptr;
+                    const bool src0_f32   = have_srcs && op->src[0]->type == GGML_TYPE_F32;
+                    const bool src1_f32   = have_srcs && op->src[1]->type == GGML_TYPE_F32;
+                    const bool dst_f32    = op->type == GGML_TYPE_F32;
+                    const bool dst_contig = ggml_is_contiguous(op);
+                    const bool kernel_ok  =
+                        op->op == GGML_OP_ADD ?
+                            backend_ctx->kernel_add != nullptr && backend_ctx->kernel_add_row != nullptr :
+                            backend_ctx->kernel_mul != nullptr && backend_ctx->kernel_mul_row != nullptr;
+                    const bool supported = src0_f32 && src1_f32 && dst_f32 && dst_contig && kernel_ok;
+
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "f32-binary-op" : "f32-binary-op-predicate-failed");
+                    return supported;
+                }
+            case GGML_OP_RMS_NORM:
+                {
+                    const bool have_src0       = op->src[0] != nullptr;
+                    const bool src0_f32        = have_src0 && op->src[0]->type == GGML_TYPE_F32;
+                    const bool dst_f32         = op->type == GGML_TYPE_F32;
+                    const bool hidden_dim_ok   = op->ne[0] >= 64 && op->ne[0] % 4 == 0;
+                    const bool src0_rows_ok    = have_src0 && ggml_is_contiguous_rows(op->src[0]);
+                    const bool dst_contig      = ggml_is_contiguous(op);
+                    const bool kernel_ok       = backend_ctx->kernel_rms_norm != nullptr;
+                    const bool supported       = src0_f32 && dst_f32 && hidden_dim_ok &&
+                                                 src0_rows_ok && dst_contig && kernel_ok;
+
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "f32-rms-norm" : "f32-rms-norm-predicate-failed");
+                    return supported;
+                }
+            case GGML_OP_GLU:
+                {
+                    const bool have_src0     = op->src[0] != nullptr;
+                    const bool src0_f32      = have_src0 && op->src[0]->type == GGML_TYPE_F32;
+                    const bool src1_ok       = op->src[1] == nullptr ||
+                                               (op->src[1]->type == GGML_TYPE_F32 &&
+                                                have_src0 &&
+                                                ggml_are_same_shape(op->src[0], op->src[1]));
+                    const bool dst_f32       = op->type == GGML_TYPE_F32;
+                    const bool swiglu        = ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU;
+                    const bool src0_contig_1 = have_src0 && ggml_is_contiguous_1(op->src[0]);
+                    const bool kernel_ok     = backend_ctx->kernel_swiglu != nullptr;
+                    const bool supported     = src0_f32 && src1_ok && dst_f32 && swiglu &&
+                                               src0_contig_1 && kernel_ok;
+
+                    ggml_opencl_legacy_trace_support(
+                        backend_ctx, op, supported,
+                        supported ? "f32-swiglu" : "f32-swiglu-predicate-failed");
+                    return supported;
+                }
             case GGML_OP_MUL_MAT:
                 {
                     const bool src0_q4_0       = op->src[0]->type == GGML_TYPE_Q4_0;
@@ -9308,7 +9644,9 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     //    CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
     //    sizeof(local_work_size), local_work_size,
     //    sizeof(size_t), &sgs, NULL));
-    if (backend_ctx->gpu_family == ADRENO) {
+    if (backend_ctx->gpu_family == NVIDIA_LEGACY) {
+        sgs = 1;
+    } else if (backend_ctx->gpu_family == ADRENO) {
         sgs = 64;
     } else if (backend_ctx->gpu_family == INTEL) {
         sgs = 32;
