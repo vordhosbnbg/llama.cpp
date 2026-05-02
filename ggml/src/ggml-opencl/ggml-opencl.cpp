@@ -8655,8 +8655,29 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
     cl_command_queue queue = backend_ctx->queue;
 
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-    for (cl_mem buf : ctx->buffer) {
-        CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
+    if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY) {
+        const size_t clear_chunk_size = 1u << 20;
+        std::vector<uint8_t> clear_chunk(clear_chunk_size, value);
+
+        if (backend_ctx->legacy_trace) {
+            GGML_LOG_INFO(
+                "ggml_opencl: legacy trace buffer-clear using write fallback size=%zu buffers=%zu\n",
+                buffer->size,
+                ctx->buffer.size());
+        }
+
+        for (cl_mem buf : ctx->buffer) {
+            size_t offset = 0;
+            while (offset < buffer->size) {
+                const size_t size = std::min(clear_chunk.size(), buffer->size - offset);
+                CL_CHECK(clEnqueueWriteBuffer(queue, buf, CL_FALSE, offset, size, clear_chunk.data(), 0, NULL, NULL));
+                offset += size;
+            }
+        }
+    } else {
+        for (cl_mem buf : ctx->buffer) {
+            CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
+        }
     }
     if (backend_ctx->gpu_family == GPU_FAMILY::NVIDIA_LEGACY && backend_ctx->legacy_trace) {
         const uint64_t finish_id = ggml_opencl_legacy_trace_record_finish(backend_ctx, "buffer-clear");
