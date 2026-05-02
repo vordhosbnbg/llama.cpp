@@ -6166,7 +6166,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                v->ne[2] == k->ne[2] &&
                                                k->ne[1] == v->ne[1] &&
                                                k->ne[1] > 0 &&
-                                               k->ne[1] <= 128 &&
+                                               k->ne[1] <= 256 &&
                                                q->ne[3] > 0 &&
                                                k->ne[3] == q->ne[3] &&
                                                v->ne[3] == q->ne[3];
@@ -11932,6 +11932,7 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
     const int n_head_kv = k->ne[2];
 
     GGML_ASSERT(n_q == 1);
+    GGML_ASSERT(n_kv <= 256);
     GGML_ASSERT(n_head_kv > 0);
     GGML_ASSERT(n_head % n_head_kv == 0);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
