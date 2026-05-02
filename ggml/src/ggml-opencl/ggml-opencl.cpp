@@ -2023,6 +2023,20 @@ float ggml_legacy_vload_half_at(__global const char * ptr, int idx) {
     return vload_half(0, (__global const half *)ptr + idx);
 }
 
+float4 ggml_legacy_load_kv4(__global const char * ptr, int ivec, int is_f16) {
+    if (is_f16) {
+        return ggml_legacy_vload_half4(ptr, ivec);
+    }
+    return ((__global const float4 *)ptr)[ivec];
+}
+
+float ggml_legacy_load_mask(__global const char * ptr, int idx, int is_f16) {
+    if (is_f16) {
+        return ggml_legacy_vload_half_at(ptr, idx);
+    }
+    return ((__global const float *)ptr)[idx];
+}
+
 __kernel void kernel_flash_attn_decode_f32_f16(
         __global const void * q_void,
         ulong q_offset,
@@ -2063,7 +2077,9 @@ __kernel void kernel_flash_attn_decode_f32_f16(
         int mask_ne2,
         int mask_ne3,
         __global const void * sinks_void,
-        ulong sinks_offset) {
+        ulong sinks_offset,
+        int kv_is_f16,
+        int mask_is_f16) {
     (void)n_q; (void)is_causal; (void)o_nb2; (void)mask_nb1;
     (void)max_bias; (void)m0; (void)m1; (void)n_head_log2;
     (void)logit_softcap; (void)sinks_void; (void)sinks_offset;
@@ -2106,12 +2122,12 @@ __kernel void kernel_flash_attn_decode_f32_f16(
         float4 dot_acc = (float4)(0.0f);
         #pragma unroll
         for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
-            dot_acc = mad(q_priv[i], ggml_legacy_vload_half4(k_row, i), dot_acc);
+            dot_acc = mad(q_priv[i], ggml_legacy_load_kv4(k_row, i, kv_is_f16), dot_acc);
         }
 
         float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != 0) {
-            score += ggml_legacy_vload_half_at(mask_base, k_idx);
+            score += ggml_legacy_load_mask(mask_base, k_idx, mask_is_f16);
         }
         m_i = max(m_i, score);
     }
@@ -2146,19 +2162,19 @@ __kernel void kernel_flash_attn_decode_f32_f16(
         float4 dot_acc = (float4)(0.0f);
         #pragma unroll
         for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
-            dot_acc = mad(q_priv[i], ggml_legacy_vload_half4(k_row, i), dot_acc);
+            dot_acc = mad(q_priv[i], ggml_legacy_load_kv4(k_row, i, kv_is_f16), dot_acc);
         }
 
         float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != 0) {
-            score += ggml_legacy_vload_half_at(mask_base, k_idx);
+            score += ggml_legacy_load_mask(mask_base, k_idx, mask_is_f16);
         }
 
         const float p = exp(score - m_final);
         l_i += p;
         #pragma unroll
         for (int i = 0; i < LEGACY_ATTN_VEC; ++i) {
-            o_acc[i] = mad(p, ggml_legacy_vload_half4(v_row, i), o_acc[i]);
+            o_acc[i] = mad(p, ggml_legacy_load_kv4(v_row, i, kv_is_f16), o_acc[i]);
         }
     }
 
@@ -6025,11 +6041,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     const float * params      = (const float *) op->op_params;
 
                     const bool have_srcs     = q != nullptr && k != nullptr && v != nullptr;
-                    const bool type_ok       = have_srcs &&
-                                               q->type == GGML_TYPE_F32 &&
-                                               k->type == GGML_TYPE_F16 &&
-                                               v->type == GGML_TYPE_F16 &&
-                                               op->type == GGML_TYPE_F32;
+                    const bool q_f32         = have_srcs && q->type == GGML_TYPE_F32;
+                    const bool kv_f16        = have_srcs && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+                    const bool kv_f32        = have_srcs && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32;
+                    const bool type_ok       = q_f32 && (kv_f16 || kv_f32) && op->type == GGML_TYPE_F32;
                     const bool dims_ok       = have_srcs &&
                                                q->ne[0] == 128 && v->ne[0] == 128 &&
                                                k->ne[0] == q->ne[0] &&
@@ -6053,9 +6068,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                k->nb[0] == ggml_type_size(k->type) &&
                                                v->nb[0] == ggml_type_size(v->type) &&
                                                op->nb[0] == ggml_type_size(op->type);
+                    const bool mask_type_ok  = mask == nullptr ||
+                                               mask->type == GGML_TYPE_F16 ||
+                                               mask->type == GGML_TYPE_F32;
                     const bool mask_ok       = mask == nullptr ||
                                                (have_srcs &&
-                                                mask->type == GGML_TYPE_F16 &&
+                                                mask_type_ok &&
                                                 mask->nb[0] == ggml_type_size(mask->type) &&
                                                 mask->ne[0] >= k->ne[1] &&
                                                 mask->ne[1] == q->ne[1] &&
@@ -6069,7 +6087,37 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 
                     ggml_opencl_legacy_trace_support(
                         backend_ctx, op, supported,
-                        supported ? "f32-f16-flash-attn-decode" : "f32-f16-flash-attn-decode-predicate-failed");
+                        supported ? "f32-kv-flash-attn-decode" : "f32-kv-flash-attn-decode-predicate-failed");
+                    if (!supported && backend_ctx->legacy_trace) {
+                        GGML_LOG_INFO(
+                            "ggml_opencl: legacy NVIDIA rejects FLASH_ATTN_EXT decode: type_ok=%s dims_ok=%s dst_shape_ok=%s stride_ok=%s mask_ok=%s params_ok=%s sinks_ok=%s kernel_ok=%s "
+                            "q_type=%s k_type=%s v_type=%s mask_type=%s dst_type=%s "
+                            "q_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                            "k_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                            "v_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                            "mask_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                            "dst_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                            "params=[%g,%g,%g]\n",
+                            ggml_opencl_bool(type_ok),
+                            ggml_opencl_bool(dims_ok),
+                            ggml_opencl_bool(dst_shape_ok),
+                            ggml_opencl_bool(stride_ok),
+                            ggml_opencl_bool(mask_ok),
+                            ggml_opencl_bool(params_ok),
+                            ggml_opencl_bool(sinks_ok),
+                            ggml_opencl_bool(kernel_ok),
+                            q ? ggml_type_name(q->type) : "<none>",
+                            k ? ggml_type_name(k->type) : "<none>",
+                            v ? ggml_type_name(v->type) : "<none>",
+                            mask ? ggml_type_name(mask->type) : "<none>",
+                            ggml_type_name(op->type),
+                            q ? q->ne[0] : 0, q ? q->ne[1] : 0, q ? q->ne[2] : 0, q ? q->ne[3] : 0,
+                            k ? k->ne[0] : 0, k ? k->ne[1] : 0, k ? k->ne[2] : 0, k ? k->ne[3] : 0,
+                            v ? v->ne[0] : 0, v ? v->ne[1] : 0, v ? v->ne[2] : 0, v ? v->ne[3] : 0,
+                            mask ? mask->ne[0] : 0, mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+                            op->ne[0], op->ne[1], op->ne[2], op->ne[3],
+                            params[0], params[1], params[2]);
+                    }
                     return supported;
                 }
             case GGML_OP_MUL_MAT:
@@ -11768,8 +11816,8 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
 
     GGML_ASSERT(n_q == 1);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F16);
-    GGML_ASSERT(v->type == GGML_TYPE_F16);
+    GGML_ASSERT((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) ||
+                (k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32));
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(backend_ctx->kernel_legacy_flash_attn_decode_f32_f16 != nullptr);
 
@@ -11787,6 +11835,8 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
     cl_ulong offset_mask = extra_mask ? extra_mask->offset + mask->view_offs : 0;
     cl_mem   sinks_buffer = nullptr;
     cl_ulong offset_sinks = 0;
+    const int kv_is_f16 = k->type == GGML_TYPE_F16;
+    const int mask_is_f16 = mask == nullptr || mask->type == GGML_TYPE_F16;
 
     const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], q_nb3 = q->nb[3];
     const cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
@@ -11851,6 +11901,8 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
     CL_CHECK(clSetKernelArg(kernel, 37, sizeof(int),      &mask_ne3));
     CL_CHECK(clSetKernelArg(kernel, 38, sizeof(cl_mem),   &sinks_buffer));
     CL_CHECK(clSetKernelArg(kernel, 39, sizeof(cl_ulong), &offset_sinks));
+    CL_CHECK(clSetKernelArg(kernel, 40, sizeof(int),      &kv_is_f16));
+    CL_CHECK(clSetKernelArg(kernel, 41, sizeof(int),      &mask_is_f16));
 
     const size_t wg_size = 64;
     size_t local_work_size[] = { wg_size, 1 };
