@@ -538,6 +538,10 @@ struct ggml_backend_opencl_context {
     bool legacy_half_storage_support;
     bool legacy_trace;
     bool legacy_profile;
+    int legacy_flash_attn_wg;
+    bool legacy_q4_0_mul_mat_cols1;
+    bool legacy_q4_0_mul_mat_warp_pack;
+    bool legacy_q4_0_mul_mat_warp_sync;
     int legacy_q4_0_mul_mat_lws;
     int legacy_q4_0_mul_mat_row_tile;
 
@@ -666,6 +670,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mm_q8_0_f32_l4_lm;
     cl_program program_legacy_mul_mat_q4_0_f32;
     cl_program program_legacy_mul_mat_q4_0_f32_r8;
+    cl_program program_legacy_mul_mat_q4_0_f32_r8c1;
     cl_program program_legacy_ops_f32;
     cl_program program_legacy_flash_attn_decode_f32_f16;
 
@@ -795,6 +800,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_legacy_mul_mat_q4_0_f32;
     cl_kernel kernel_legacy_mul_mat_q4_0_f32_r4;
     cl_kernel kernel_legacy_mul_mat_q4_0_f32_r8;
+    cl_kernel kernel_legacy_mul_mat_q4_0_f32_r8c1;
+    cl_kernel kernel_legacy_mul_mat_q4_0_f32_r8c1wp;
+    cl_kernel kernel_legacy_mul_mat_q4_0_f32_r8c1wp2;
 
     std::vector<ProfilingInfo> profiling_info;
 
@@ -1709,6 +1717,27 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
         }
         ctx->kernel_legacy_mul_mat_q4_0_f32_r8 = nullptr;
     }
+    if (ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1 != nullptr) {
+        cl_int err = clReleaseKernel(ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 row-tile r8 cols1 kernel: %d\n", err);
+        }
+        ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1 = nullptr;
+    }
+    if (ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp != nullptr) {
+        cl_int err = clReleaseKernel(ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 row-tile r8 cols1 warp-pack kernel: %d\n", err);
+        }
+        ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp = nullptr;
+    }
+    if (ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2 != nullptr) {
+        cl_int err = clReleaseKernel(ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 row-tile r8 cols1 warp-pack k3072 kernel: %d\n", err);
+        }
+        ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2 = nullptr;
+    }
 
     cl_kernel * legacy_ops[] = {
         &ctx->kernel_add,
@@ -1748,7 +1777,13 @@ static void ggml_cl_release_legacy_nvidia_resources(ggml_backend_opencl_context 
         }
         ctx->program_legacy_mul_mat_q4_0_f32_r8 = nullptr;
     }
-
+    if (ctx->program_legacy_mul_mat_q4_0_f32_r8c1 != nullptr) {
+        cl_int err = clReleaseProgram(ctx->program_legacy_mul_mat_q4_0_f32_r8c1);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_WARN("ggml_opencl: failed to release legacy Q4_0 row-tile r8 cols1 program: %d\n", err);
+        }
+        ctx->program_legacy_mul_mat_q4_0_f32_r8c1 = nullptr;
+    }
     if (ctx->program_legacy_ops_f32 != nullptr) {
         cl_int err = clReleaseProgram(ctx->program_legacy_ops_f32);
         if (err != CL_SUCCESS) {
@@ -2525,7 +2560,9 @@ __kernel void kernel_rope_neox_f32(
     static const char * legacy_flash_attn_decode_kernel = R"CLC(
 #define LEGACY_ATTN_D 128
 #define LEGACY_ATTN_VEC (LEGACY_ATTN_D / 4)
+#ifndef LEGACY_ATTN_WG
 #define LEGACY_ATTN_WG 64
+#endif
 
 float4 ggml_legacy_vload_half4(__global const char * ptr, int ivec) {
     __global const half * hptr = (__global const half *)ptr + 4 * ivec;
@@ -2552,6 +2589,13 @@ float ggml_legacy_load_mask(__global const char * ptr, int idx, int is_f16) {
         return ggml_legacy_vload_half_at(ptr, idx);
     }
     return ((__global const float *)ptr)[idx];
+}
+
+int ggml_legacy_mask_is_neg_inf(__global const char * ptr, int idx, int is_f16) {
+    if (is_f16) {
+        return ((__global const ushort *)ptr)[idx] == (ushort)0xfc00;
+    }
+    return ((__global const uint *)ptr)[idx] == 0xff800000u;
 }
 
 __kernel void kernel_flash_attn_decode_f32_f16(
@@ -2636,6 +2680,14 @@ __kernel void kernel_flash_attn_decode_f32_f16(
 
     float m_i = -INFINITY;
     for (int k_idx = tid; k_idx < n_kv; k_idx += LEGACY_ATTN_WG) {
+        float mask_value = 0.0f;
+        if (mask_base != 0) {
+            if (ggml_legacy_mask_is_neg_inf(mask_base, k_idx, mask_is_f16)) {
+                continue;
+            }
+            mask_value = ggml_legacy_load_mask(mask_base, k_idx, mask_is_f16);
+        }
+
         const ulong k_row_offset =
             (ulong)batch_idx * k_nb3 + (ulong)head_kv_idx * k_nb2 + (ulong)k_idx * k_nb1;
         __global const char * k_row = k_base + k_row_offset;
@@ -2646,10 +2698,7 @@ __kernel void kernel_flash_attn_decode_f32_f16(
             dot_acc = mad(q_priv[i], ggml_legacy_load_kv4(k_row, i, kv_is_f16), dot_acc);
         }
 
-        float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
-        if (mask_base != 0) {
-            score += ggml_legacy_load_mask(mask_base, k_idx, mask_is_f16);
-        }
+        const float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale + mask_value;
         m_i = max(m_i, score);
     }
 
@@ -2673,6 +2722,14 @@ __kernel void kernel_flash_attn_decode_f32_f16(
 
     float l_i = 0.0f;
     for (int k_idx = tid; k_idx < n_kv; k_idx += LEGACY_ATTN_WG) {
+        float mask_value = 0.0f;
+        if (mask_base != 0) {
+            if (ggml_legacy_mask_is_neg_inf(mask_base, k_idx, mask_is_f16)) {
+                continue;
+            }
+            mask_value = ggml_legacy_load_mask(mask_base, k_idx, mask_is_f16);
+        }
+
         const ulong k_row_offset =
             (ulong)batch_idx * k_nb3 + (ulong)head_kv_idx * k_nb2 + (ulong)k_idx * k_nb1;
         const ulong v_row_offset =
@@ -2686,10 +2743,7 @@ __kernel void kernel_flash_attn_decode_f32_f16(
             dot_acc = mad(q_priv[i], ggml_legacy_load_kv4(k_row, i, kv_is_f16), dot_acc);
         }
 
-        float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
-        if (mask_base != 0) {
-            score += ggml_legacy_load_mask(mask_base, k_idx, mask_is_f16);
-        }
+        const float score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale + mask_value;
 
         const float p = exp(score - m_final);
         l_i += p;
@@ -2747,7 +2801,7 @@ __kernel void kernel_flash_attn_decode_f32_f16(
             backend_ctx->device,
             "legacy-flash-attn-decode",
             legacy_flash_attn_decode_kernel,
-            compile_opts);
+            compile_opts + " -DLEGACY_ATTN_WG=" + std::to_string(backend_ctx->legacy_flash_attn_wg));
 
     if (backend_ctx->program_legacy_flash_attn_decode_f32_f16 != nullptr) {
         CL_CHECK((backend_ctx->kernel_legacy_flash_attn_decode_f32_f16 =
@@ -2766,6 +2820,14 @@ struct __attribute__((packed)) block_q4_0 {
     half d;
     uint8_t qs[QK4_0 / 2];
 };
+
+#ifdef GGML_LEGACY_Q4_0_WARP_SYNC
+#define GGML_LEGACY_Q4_0_WARP_TMP volatile __local float *
+#define GGML_LEGACY_Q4_0_WARP_BARRIER()
+#else
+#define GGML_LEGACY_Q4_0_WARP_TMP __local float *
+#define GGML_LEGACY_Q4_0_WARP_BARRIER() barrier(CLK_LOCAL_MEM_FENCE)
+#endif
 
 __kernel void ggml_legacy_mul_mat_q4_0_f32(
         __global const void * src0,
@@ -3193,6 +3255,469 @@ __kernel void ggml_legacy_mul_mat_q4_0_f32_r8(
     }
 }
 #endif
+
+#ifdef GGML_LEGACY_Q4_0_R8C1
+__kernel void ggml_legacy_mul_mat_q4_0_f32_r8c1(
+        __global const void * src0,
+        ulong offset0,
+        __global const float * src1,
+        ulong offset1,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne11,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int row_tile,
+        __local float * tmp) {
+    (void)ne01; (void)ne02; (void)ne10; (void)ne11; (void)ne0; (void)ne1;
+    (void)nb10; (void)nb11; (void)nb0; (void)nb1; (void)row_tile;
+
+    const int row_base = get_group_id(0) * 8;
+    const int im  = get_group_id(2);
+    const int tid = get_local_id(0);
+    const int local_size = get_local_size(0);
+
+    const int i12 = im % ne12;
+    const int i13 = im / ne12;
+    const int nb = ne00 / QK4_0;
+
+    const ulong x_base_offset = offset0 +
+        (ulong)(i12 / r2) * nb02 + (ulong)(i13 / r3) * nb03;
+    __global const char * src0_base = (__global const char *)src0 + x_base_offset;
+
+    __global const struct block_q4_0 * x0 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 0) * nb01);
+    __global const struct block_q4_0 * x1 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 1) * nb01);
+    __global const struct block_q4_0 * x2 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 2) * nb01);
+    __global const struct block_q4_0 * x3 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 3) * nb01);
+    __global const struct block_q4_0 * x4 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 4) * nb01);
+    __global const struct block_q4_0 * x5 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 5) * nb01);
+    __global const struct block_q4_0 * x6 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 6) * nb01);
+    __global const struct block_q4_0 * x7 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 7) * nb01);
+
+    __global const float * y = (__global const float *)((__global const char *)src1 + offset1 +
+        (ulong)i12 * nb12 + (ulong)i13 * nb13);
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    float sum6 = 0.0f;
+    float sum7 = 0.0f;
+
+    if (tid < nb) {
+        const float d0 = vload_half(0, &x0[tid].d);
+        const float d1 = vload_half(0, &x1[tid].d);
+        const float d2 = vload_half(0, &x2[tid].d);
+        const float d3 = vload_half(0, &x3[tid].d);
+        const float d4 = vload_half(0, &x4[tid].d);
+        const float d5 = vload_half(0, &x5[tid].d);
+        const float d6 = vload_half(0, &x6[tid].d);
+        const float d7 = vload_half(0, &x7[tid].d);
+        __global const uint8_t * qs0 = x0[tid].qs;
+        __global const uint8_t * qs1 = x1[tid].qs;
+        __global const uint8_t * qs2 = x2[tid].qs;
+        __global const uint8_t * qs3 = x3[tid].qs;
+        __global const uint8_t * qs4 = x4[tid].qs;
+        __global const uint8_t * qs5 = x5[tid].qs;
+        __global const uint8_t * qs6 = x6[tid].qs;
+        __global const uint8_t * qs7 = x7[tid].qs;
+        const int y_base = tid * QK4_0;
+
+        #pragma unroll
+        for (int i = 0; i < QK4_0 / 2; ++i) {
+            const float y0 = y[y_base + i];
+            const float y1 = y[y_base + i + QK4_0 / 2];
+            const uint8_t q0 = qs0[i];
+            const uint8_t q1 = qs1[i];
+            const uint8_t q2 = qs2[i];
+            const uint8_t q3 = qs3[i];
+            const uint8_t q4 = qs4[i];
+            const uint8_t q5 = qs5[i];
+            const uint8_t q6 = qs6[i];
+            const uint8_t q7 = qs7[i];
+            sum0 += ((int)(q0 & 0x0F) - 8) * d0 * y0 + ((int)(q0 >> 4) - 8) * d0 * y1;
+            sum1 += ((int)(q1 & 0x0F) - 8) * d1 * y0 + ((int)(q1 >> 4) - 8) * d1 * y1;
+            sum2 += ((int)(q2 & 0x0F) - 8) * d2 * y0 + ((int)(q2 >> 4) - 8) * d2 * y1;
+            sum3 += ((int)(q3 & 0x0F) - 8) * d3 * y0 + ((int)(q3 >> 4) - 8) * d3 * y1;
+            sum4 += ((int)(q4 & 0x0F) - 8) * d4 * y0 + ((int)(q4 >> 4) - 8) * d4 * y1;
+            sum5 += ((int)(q5 & 0x0F) - 8) * d5 * y0 + ((int)(q5 >> 4) - 8) * d5 * y1;
+            sum6 += ((int)(q6 & 0x0F) - 8) * d6 * y0 + ((int)(q6 >> 4) - 8) * d6 * y1;
+            sum7 += ((int)(q7 & 0x0F) - 8) * d7 * y0 + ((int)(q7 >> 4) - 8) * d7 * y1;
+        }
+    }
+
+    tmp[tid] = sum0;
+    tmp[local_size + tid] = sum1;
+    tmp[2 * local_size + tid] = sum2;
+    tmp[3 * local_size + tid] = sum3;
+    tmp[4 * local_size + tid] = sum4;
+    tmp[5 * local_size + tid] = sum5;
+    tmp[6 * local_size + tid] = sum6;
+    tmp[7 * local_size + tid] = sum7;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            tmp[tid] += tmp[tid + stride];
+            tmp[local_size + tid] += tmp[local_size + tid + stride];
+            tmp[2 * local_size + tid] += tmp[2 * local_size + tid + stride];
+            tmp[3 * local_size + tid] += tmp[3 * local_size + tid + stride];
+            tmp[4 * local_size + tid] += tmp[4 * local_size + tid + stride];
+            tmp[5 * local_size + tid] += tmp[5 * local_size + tid + stride];
+            tmp[6 * local_size + tid] += tmp[6 * local_size + tid + stride];
+            tmp[7 * local_size + tid] += tmp[7 * local_size + tid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid == 0) {
+        __global float * out = (__global float *)((__global char *)dst + offsetd +
+            (ulong)i12 * nb2 + (ulong)i13 * nb3);
+        out[row_base + 0] = tmp[0];
+        out[row_base + 1] = tmp[local_size];
+        out[row_base + 2] = tmp[2 * local_size];
+        out[row_base + 3] = tmp[3 * local_size];
+        out[row_base + 4] = tmp[4 * local_size];
+        out[row_base + 5] = tmp[5 * local_size];
+        out[row_base + 6] = tmp[6 * local_size];
+        out[row_base + 7] = tmp[7 * local_size];
+    }
+}
+
+__kernel void ggml_legacy_mul_mat_q4_0_f32_r8c1wp(
+        __global const void * src0,
+        ulong offset0,
+        __global const float * src1,
+        ulong offset1,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne11,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int row_tile,
+        GGML_LEGACY_Q4_0_WARP_TMP tmp) {
+    (void)ne00; (void)ne01; (void)ne02; (void)ne10; (void)ne11; (void)ne0; (void)ne1;
+    (void)nb10; (void)nb11; (void)nb0; (void)nb1; (void)row_tile;
+
+    const int row_groups_per_block = 4;
+    const int warp_size = 32;
+    const int tid = get_local_id(0);
+    const int lane = tid & (warp_size - 1);
+    const int warp = tid >> 5;
+    const int row_base = (get_group_id(0) * row_groups_per_block + warp) * 8;
+    const int im  = get_group_id(2);
+
+    const int i12 = im % ne12;
+    const int i13 = im / ne12;
+    const int nb = 32;
+
+    const ulong x_base_offset = offset0 +
+        (ulong)(i12 / r2) * nb02 + (ulong)(i13 / r3) * nb03;
+    __global const char * src0_base = (__global const char *)src0 + x_base_offset;
+
+    __global const struct block_q4_0 * x0 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 0) * nb01);
+    __global const struct block_q4_0 * x1 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 1) * nb01);
+    __global const struct block_q4_0 * x2 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 2) * nb01);
+    __global const struct block_q4_0 * x3 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 3) * nb01);
+    __global const struct block_q4_0 * x4 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 4) * nb01);
+    __global const struct block_q4_0 * x5 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 5) * nb01);
+    __global const struct block_q4_0 * x6 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 6) * nb01);
+    __global const struct block_q4_0 * x7 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 7) * nb01);
+
+    __global const float * y = (__global const float *)((__global const char *)src1 + offset1 +
+        (ulong)i12 * nb12 + (ulong)i13 * nb13);
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    float sum6 = 0.0f;
+    float sum7 = 0.0f;
+
+    if (lane < nb) {
+        const float d0 = vload_half(0, &x0[lane].d);
+        const float d1 = vload_half(0, &x1[lane].d);
+        const float d2 = vload_half(0, &x2[lane].d);
+        const float d3 = vload_half(0, &x3[lane].d);
+        const float d4 = vload_half(0, &x4[lane].d);
+        const float d5 = vload_half(0, &x5[lane].d);
+        const float d6 = vload_half(0, &x6[lane].d);
+        const float d7 = vload_half(0, &x7[lane].d);
+        __global const uint8_t * qs0 = x0[lane].qs;
+        __global const uint8_t * qs1 = x1[lane].qs;
+        __global const uint8_t * qs2 = x2[lane].qs;
+        __global const uint8_t * qs3 = x3[lane].qs;
+        __global const uint8_t * qs4 = x4[lane].qs;
+        __global const uint8_t * qs5 = x5[lane].qs;
+        __global const uint8_t * qs6 = x6[lane].qs;
+        __global const uint8_t * qs7 = x7[lane].qs;
+        const int y_base = lane * QK4_0;
+
+        #pragma unroll
+        for (int i = 0; i < QK4_0 / 2; ++i) {
+            const float y0 = y[y_base + i];
+            const float y1 = y[y_base + i + QK4_0 / 2];
+            const uint8_t q0 = qs0[i];
+            const uint8_t q1 = qs1[i];
+            const uint8_t q2 = qs2[i];
+            const uint8_t q3 = qs3[i];
+            const uint8_t q4 = qs4[i];
+            const uint8_t q5 = qs5[i];
+            const uint8_t q6 = qs6[i];
+            const uint8_t q7 = qs7[i];
+            sum0 += ((int)(q0 & 0x0F) - 8) * d0 * y0 + ((int)(q0 >> 4) - 8) * d0 * y1;
+            sum1 += ((int)(q1 & 0x0F) - 8) * d1 * y0 + ((int)(q1 >> 4) - 8) * d1 * y1;
+            sum2 += ((int)(q2 & 0x0F) - 8) * d2 * y0 + ((int)(q2 >> 4) - 8) * d2 * y1;
+            sum3 += ((int)(q3 & 0x0F) - 8) * d3 * y0 + ((int)(q3 >> 4) - 8) * d3 * y1;
+            sum4 += ((int)(q4 & 0x0F) - 8) * d4 * y0 + ((int)(q4 >> 4) - 8) * d4 * y1;
+            sum5 += ((int)(q5 & 0x0F) - 8) * d5 * y0 + ((int)(q5 >> 4) - 8) * d5 * y1;
+            sum6 += ((int)(q6 & 0x0F) - 8) * d6 * y0 + ((int)(q6 >> 4) - 8) * d6 * y1;
+            sum7 += ((int)(q7 & 0x0F) - 8) * d7 * y0 + ((int)(q7 >> 4) - 8) * d7 * y1;
+        }
+    }
+
+    const int tmp_base = warp * 8 * warp_size;
+    tmp[tmp_base + lane] = sum0;
+    tmp[tmp_base + warp_size + lane] = sum1;
+    tmp[tmp_base + 2 * warp_size + lane] = sum2;
+    tmp[tmp_base + 3 * warp_size + lane] = sum3;
+    tmp[tmp_base + 4 * warp_size + lane] = sum4;
+    tmp[tmp_base + 5 * warp_size + lane] = sum5;
+    tmp[tmp_base + 6 * warp_size + lane] = sum6;
+    tmp[tmp_base + 7 * warp_size + lane] = sum7;
+    GGML_LEGACY_Q4_0_WARP_BARRIER();
+
+    for (int stride = warp_size / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            tmp[tmp_base + lane] += tmp[tmp_base + lane + stride];
+            tmp[tmp_base + warp_size + lane] += tmp[tmp_base + warp_size + lane + stride];
+            tmp[tmp_base + 2 * warp_size + lane] += tmp[tmp_base + 2 * warp_size + lane + stride];
+            tmp[tmp_base + 3 * warp_size + lane] += tmp[tmp_base + 3 * warp_size + lane + stride];
+            tmp[tmp_base + 4 * warp_size + lane] += tmp[tmp_base + 4 * warp_size + lane + stride];
+            tmp[tmp_base + 5 * warp_size + lane] += tmp[tmp_base + 5 * warp_size + lane + stride];
+            tmp[tmp_base + 6 * warp_size + lane] += tmp[tmp_base + 6 * warp_size + lane + stride];
+            tmp[tmp_base + 7 * warp_size + lane] += tmp[tmp_base + 7 * warp_size + lane + stride];
+        }
+        GGML_LEGACY_Q4_0_WARP_BARRIER();
+    }
+
+    if (lane == 0) {
+        __global float * out = (__global float *)((__global char *)dst + offsetd +
+            (ulong)i12 * nb2 + (ulong)i13 * nb3);
+        out[row_base + 0] = tmp[tmp_base];
+        out[row_base + 1] = tmp[tmp_base + warp_size];
+        out[row_base + 2] = tmp[tmp_base + 2 * warp_size];
+        out[row_base + 3] = tmp[tmp_base + 3 * warp_size];
+        out[row_base + 4] = tmp[tmp_base + 4 * warp_size];
+        out[row_base + 5] = tmp[tmp_base + 5 * warp_size];
+        out[row_base + 6] = tmp[tmp_base + 6 * warp_size];
+        out[row_base + 7] = tmp[tmp_base + 7 * warp_size];
+    }
+}
+
+__kernel void ggml_legacy_mul_mat_q4_0_f32_r8c1wp2(
+        __global const void * src0,
+        ulong offset0,
+        __global const float * src1,
+        ulong offset1,
+        __global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne11,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int row_tile,
+        GGML_LEGACY_Q4_0_WARP_TMP tmp) {
+    (void)ne00; (void)ne01; (void)ne02; (void)ne10; (void)ne11; (void)ne0; (void)ne1;
+    (void)nb10; (void)nb11; (void)nb0; (void)nb1; (void)row_tile;
+
+    const int row_groups_per_block = 2;
+    const int lanes_per_tile = 96;
+    const int tid = get_local_id(0);
+    const int tile = tid >= lanes_per_tile ? 1 : 0;
+    const int lane = tid - tile * lanes_per_tile;
+    const int row_base = (get_group_id(0) * row_groups_per_block + tile) * 8;
+    const int im  = get_group_id(2);
+
+    const int i12 = im % ne12;
+    const int i13 = im / ne12;
+    const int nb = 96;
+
+    const ulong x_base_offset = offset0 +
+        (ulong)(i12 / r2) * nb02 + (ulong)(i13 / r3) * nb03;
+    __global const char * src0_base = (__global const char *)src0 + x_base_offset;
+
+    __global const struct block_q4_0 * x0 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 0) * nb01);
+    __global const struct block_q4_0 * x1 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 1) * nb01);
+    __global const struct block_q4_0 * x2 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 2) * nb01);
+    __global const struct block_q4_0 * x3 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 3) * nb01);
+    __global const struct block_q4_0 * x4 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 4) * nb01);
+    __global const struct block_q4_0 * x5 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 5) * nb01);
+    __global const struct block_q4_0 * x6 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 6) * nb01);
+    __global const struct block_q4_0 * x7 = (__global const struct block_q4_0 *)(src0_base + (ulong)(row_base + 7) * nb01);
+
+    __global const float * y = (__global const float *)((__global const char *)src1 + offset1 +
+        (ulong)i12 * nb12 + (ulong)i13 * nb13);
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    float sum6 = 0.0f;
+    float sum7 = 0.0f;
+
+    if (lane < nb) {
+        const float d0 = vload_half(0, &x0[lane].d);
+        const float d1 = vload_half(0, &x1[lane].d);
+        const float d2 = vload_half(0, &x2[lane].d);
+        const float d3 = vload_half(0, &x3[lane].d);
+        const float d4 = vload_half(0, &x4[lane].d);
+        const float d5 = vload_half(0, &x5[lane].d);
+        const float d6 = vload_half(0, &x6[lane].d);
+        const float d7 = vload_half(0, &x7[lane].d);
+        __global const uint8_t * qs0 = x0[lane].qs;
+        __global const uint8_t * qs1 = x1[lane].qs;
+        __global const uint8_t * qs2 = x2[lane].qs;
+        __global const uint8_t * qs3 = x3[lane].qs;
+        __global const uint8_t * qs4 = x4[lane].qs;
+        __global const uint8_t * qs5 = x5[lane].qs;
+        __global const uint8_t * qs6 = x6[lane].qs;
+        __global const uint8_t * qs7 = x7[lane].qs;
+        const int y_base = lane * QK4_0;
+
+        #pragma unroll
+        for (int i = 0; i < QK4_0 / 2; ++i) {
+            const float y0 = y[y_base + i];
+            const float y1 = y[y_base + i + QK4_0 / 2];
+            const uint8_t q0 = qs0[i];
+            const uint8_t q1 = qs1[i];
+            const uint8_t q2 = qs2[i];
+            const uint8_t q3 = qs3[i];
+            const uint8_t q4 = qs4[i];
+            const uint8_t q5 = qs5[i];
+            const uint8_t q6 = qs6[i];
+            const uint8_t q7 = qs7[i];
+            sum0 += ((int)(q0 & 0x0F) - 8) * d0 * y0 + ((int)(q0 >> 4) - 8) * d0 * y1;
+            sum1 += ((int)(q1 & 0x0F) - 8) * d1 * y0 + ((int)(q1 >> 4) - 8) * d1 * y1;
+            sum2 += ((int)(q2 & 0x0F) - 8) * d2 * y0 + ((int)(q2 >> 4) - 8) * d2 * y1;
+            sum3 += ((int)(q3 & 0x0F) - 8) * d3 * y0 + ((int)(q3 >> 4) - 8) * d3 * y1;
+            sum4 += ((int)(q4 & 0x0F) - 8) * d4 * y0 + ((int)(q4 >> 4) - 8) * d4 * y1;
+            sum5 += ((int)(q5 & 0x0F) - 8) * d5 * y0 + ((int)(q5 >> 4) - 8) * d5 * y1;
+            sum6 += ((int)(q6 & 0x0F) - 8) * d6 * y0 + ((int)(q6 >> 4) - 8) * d6 * y1;
+            sum7 += ((int)(q7 & 0x0F) - 8) * d7 * y0 + ((int)(q7 >> 4) - 8) * d7 * y1;
+        }
+    }
+
+    const int tmp_base = tile * 8 * lanes_per_tile;
+    tmp[tmp_base + lane] = sum0;
+    tmp[tmp_base + lanes_per_tile + lane] = sum1;
+    tmp[tmp_base + 2 * lanes_per_tile + lane] = sum2;
+    tmp[tmp_base + 3 * lanes_per_tile + lane] = sum3;
+    tmp[tmp_base + 4 * lanes_per_tile + lane] = sum4;
+    tmp[tmp_base + 5 * lanes_per_tile + lane] = sum5;
+    tmp[tmp_base + 6 * lanes_per_tile + lane] = sum6;
+    tmp[tmp_base + 7 * lanes_per_tile + lane] = sum7;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lane < 32) {
+        tmp[tmp_base + lane] += tmp[tmp_base + lane + 64];
+        tmp[tmp_base + lanes_per_tile + lane] += tmp[tmp_base + lanes_per_tile + lane + 64];
+        tmp[tmp_base + 2 * lanes_per_tile + lane] += tmp[tmp_base + 2 * lanes_per_tile + lane + 64];
+        tmp[tmp_base + 3 * lanes_per_tile + lane] += tmp[tmp_base + 3 * lanes_per_tile + lane + 64];
+        tmp[tmp_base + 4 * lanes_per_tile + lane] += tmp[tmp_base + 4 * lanes_per_tile + lane + 64];
+        tmp[tmp_base + 5 * lanes_per_tile + lane] += tmp[tmp_base + 5 * lanes_per_tile + lane + 64];
+        tmp[tmp_base + 6 * lanes_per_tile + lane] += tmp[tmp_base + 6 * lanes_per_tile + lane + 64];
+        tmp[tmp_base + 7 * lanes_per_tile + lane] += tmp[tmp_base + 7 * lanes_per_tile + lane + 64];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = 32; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            tmp[tmp_base + lane] += tmp[tmp_base + lane + stride];
+            tmp[tmp_base + lanes_per_tile + lane] += tmp[tmp_base + lanes_per_tile + lane + stride];
+            tmp[tmp_base + 2 * lanes_per_tile + lane] += tmp[tmp_base + 2 * lanes_per_tile + lane + stride];
+            tmp[tmp_base + 3 * lanes_per_tile + lane] += tmp[tmp_base + 3 * lanes_per_tile + lane + stride];
+            tmp[tmp_base + 4 * lanes_per_tile + lane] += tmp[tmp_base + 4 * lanes_per_tile + lane + stride];
+            tmp[tmp_base + 5 * lanes_per_tile + lane] += tmp[tmp_base + 5 * lanes_per_tile + lane + stride];
+            tmp[tmp_base + 6 * lanes_per_tile + lane] += tmp[tmp_base + 6 * lanes_per_tile + lane + stride];
+            tmp[tmp_base + 7 * lanes_per_tile + lane] += tmp[tmp_base + 7 * lanes_per_tile + lane + stride];
+        }
+        GGML_LEGACY_Q4_0_WARP_BARRIER();
+    }
+
+    if (lane == 0) {
+        __global float * out = (__global float *)((__global char *)dst + offsetd +
+            (ulong)i12 * nb2 + (ulong)i13 * nb3);
+        out[row_base + 0] = tmp[tmp_base];
+        out[row_base + 1] = tmp[tmp_base + lanes_per_tile];
+        out[row_base + 2] = tmp[tmp_base + 2 * lanes_per_tile];
+        out[row_base + 3] = tmp[tmp_base + 3 * lanes_per_tile];
+        out[row_base + 4] = tmp[tmp_base + 4 * lanes_per_tile];
+        out[row_base + 5] = tmp[tmp_base + 5 * lanes_per_tile];
+        out[row_base + 6] = tmp[tmp_base + 6 * lanes_per_tile];
+        out[row_base + 7] = tmp[tmp_base + 7 * lanes_per_tile];
+    }
+}
+#endif
 )CLC";
 
     backend_ctx->program_legacy_mul_mat_q4_0_f32 =
@@ -3219,6 +3744,41 @@ __kernel void ggml_legacy_mul_mat_q4_0_f32_r8(
                 backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8 = nullptr;
             }
         }
+        if (backend_ctx->legacy_q4_0_mul_mat_cols1) {
+            std::string q4_0_r8c1_compile_opts = compile_opts + " -DGGML_LEGACY_Q4_0_R8C1=1";
+            if (backend_ctx->legacy_q4_0_mul_mat_warp_sync) {
+                q4_0_r8c1_compile_opts += " -DGGML_LEGACY_Q4_0_WARP_SYNC=1";
+            }
+            backend_ctx->program_legacy_mul_mat_q4_0_f32_r8c1 =
+                try_build_program_from_source(
+                    backend_ctx->context,
+                    backend_ctx->device,
+                    "legacy-q4_0-r8c1",
+                    q4_0_kernel,
+                    q4_0_r8c1_compile_opts);
+        }
+        if (backend_ctx->program_legacy_mul_mat_q4_0_f32_r8c1 != nullptr) {
+            backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1 =
+                clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32_r8c1, "ggml_legacy_mul_mat_q4_0_f32_r8c1", &err);
+            if (err != CL_SUCCESS) {
+                GGML_LOG_WARN("ggml_opencl: optional legacy Q4_0 row-tile r8 cols1 kernel failed to create: %d\n", err);
+                backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1 = nullptr;
+            }
+            if (backend_ctx->legacy_q4_0_mul_mat_warp_pack) {
+                backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp =
+                    clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32_r8c1, "ggml_legacy_mul_mat_q4_0_f32_r8c1wp", &err);
+                if (err != CL_SUCCESS) {
+                    GGML_LOG_WARN("ggml_opencl: optional legacy Q4_0 row-tile r8 cols1 warp-pack kernel failed to create: %d\n", err);
+                    backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp = nullptr;
+                }
+                backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2 =
+                    clCreateKernel(backend_ctx->program_legacy_mul_mat_q4_0_f32_r8c1, "ggml_legacy_mul_mat_q4_0_f32_r8c1wp2", &err);
+                if (err != CL_SUCCESS) {
+                    GGML_LOG_WARN("ggml_opencl: optional legacy Q4_0 row-tile r8 cols1 warp-pack k3072 kernel failed to create: %d\n", err);
+                    backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2 = nullptr;
+                }
+            }
+        }
         if (backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8 == nullptr) {
             GGML_LOG_WARN("ggml_opencl: legacy Q4_0 row tile 8 unavailable; falling back to row tile 4\n");
         }
@@ -3227,6 +3787,12 @@ __kernel void ggml_legacy_mul_mat_q4_0_f32_r8(
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 row-tile matmul kernel: true\n");
     GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 row-tile r8 matmul kernel: %s\n",
         backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8 != nullptr ? "true" : "false");
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 row-tile r8 cols1 matmul kernel: %s\n",
+        backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1 != nullptr ? "true" : "false");
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 row-tile r8 cols1 warp-pack matmul kernel: %s\n",
+        backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp != nullptr ? "true" : "false");
+    GGML_LOG_INFO("ggml_opencl: legacy NVIDIA Q4_0 x F32 row-tile r8 cols1 warp-pack k3072 matmul kernel: %s\n",
+        backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2 != nullptr ? "true" : "false");
 
     return true;
 }
@@ -5647,6 +6213,14 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->legacy_half_storage_support = false;
     backend_ctx->legacy_trace = ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_TRACE");
     backend_ctx->legacy_profile = ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_PROFILE");
+    backend_ctx->legacy_flash_attn_wg =
+        ggml_opencl_env_int("GGML_OPENCL_NVIDIA_LEGACY_ATTN_WG", 64);
+    backend_ctx->legacy_q4_0_mul_mat_cols1 =
+        !ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_DISABLE_COLS1");
+    backend_ctx->legacy_q4_0_mul_mat_warp_pack =
+        ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_WARP_PACK");
+    backend_ctx->legacy_q4_0_mul_mat_warp_sync =
+        ggml_opencl_env_enabled("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_WARP_SYNC");
     backend_ctx->legacy_q4_0_mul_mat_lws =
         ggml_opencl_env_int("GGML_OPENCL_NVIDIA_LEGACY_Q4_0_MUL_MAT_LWS", 0);
     backend_ctx->legacy_q4_0_mul_mat_row_tile =
@@ -5808,6 +6382,34 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
         clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &backend_ctx->max_workgroup_size, NULL);
         GGML_LOG_INFO("ggml_opencl: device max workgroup size: %lu\n", backend_ctx->max_workgroup_size);
+
+        if (backend_ctx->legacy_flash_attn_wg != 16 &&
+                backend_ctx->legacy_flash_attn_wg != 32 &&
+                backend_ctx->legacy_flash_attn_wg != 64 &&
+                backend_ctx->legacy_flash_attn_wg != 128) {
+            GGML_LOG_WARN(
+                "ggml_opencl: ignoring invalid legacy decode attention workgroup size %d; using 64\n",
+                backend_ctx->legacy_flash_attn_wg);
+            backend_ctx->legacy_flash_attn_wg = 64;
+        }
+        if ((size_t) backend_ctx->legacy_flash_attn_wg > backend_ctx->max_workgroup_size) {
+            GGML_LOG_WARN(
+                "ggml_opencl: legacy decode attention workgroup size %d exceeds device limit; using 64\n",
+                backend_ctx->legacy_flash_attn_wg);
+            backend_ctx->legacy_flash_attn_wg = 64;
+        }
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy NVIDIA decode attention workgroup size: %d\n",
+            backend_ctx->legacy_flash_attn_wg);
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy NVIDIA Q4_0 matmul cols1 specialization: %s\n",
+            backend_ctx->legacy_q4_0_mul_mat_cols1 ? "true" : "false");
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy NVIDIA Q4_0 matmul warp-pack specialization: %s\n",
+            backend_ctx->legacy_q4_0_mul_mat_warp_pack ? "true" : "false");
+        GGML_LOG_INFO(
+            "ggml_opencl: legacy NVIDIA Q4_0 matmul warp-sync reduction: %s\n",
+            backend_ctx->legacy_q4_0_mul_mat_warp_sync ? "true" : "false");
 
         if (backend_ctx->legacy_q4_0_mul_mat_lws != 0 &&
                 (backend_ctx->legacy_q4_0_mul_mat_lws < 16 ||
@@ -13027,10 +13629,23 @@ static void ggml_cl_legacy_flash_attn_decode_f32_f16(ggml_backend_t backend, con
     CL_CHECK(clSetKernelArg(kernel, 40, sizeof(int),      &kv_is_f16));
     CL_CHECK(clSetKernelArg(kernel, 41, sizeof(int),      &mask_is_f16));
 
-    const size_t wg_size = 64;
+    const size_t wg_size = (size_t) backend_ctx->legacy_flash_attn_wg;
     size_t local_work_size[] = { wg_size, 1, 1 };
     size_t global_work_size[] = { wg_size, (size_t) n_head, (size_t) (n_q * q->ne[3]) };
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+    char profile_kernel_name[128];
+    snprintf(
+        profile_kernel_name,
+        sizeof(profile_kernel_name),
+        "ggml_legacy_flash_attn_decode_f32_%s_wg%zu_q%d_kv%d_h%d_hkv%d",
+        kv_is_f16 ? "f16" : "f32",
+        wg_size,
+        n_q,
+        n_kv,
+        n_head,
+        n_head_kv);
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst, profile_kernel_name);
 }
 
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
@@ -14635,8 +15250,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         cl_kernel legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32;
         GGML_ASSERT(legacy_kernel != nullptr);
 
-        const size_t local_size = ggml_opencl_legacy_q4_0_mul_mat_lws(backend_ctx, ne00);
+        const size_t base_local_size = ggml_opencl_legacy_q4_0_mul_mat_lws(backend_ctx, ne00);
+        size_t local_size = base_local_size;
         const int row_tile = ggml_opencl_legacy_q4_0_mul_mat_row_tile(backend_ctx, ne01);
+        const int nb_q4 = ne00 / 32;
         if (row_tile > 4) {
             legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8;
             GGML_ASSERT(legacy_kernel != nullptr);
@@ -14645,16 +15262,88 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             GGML_ASSERT(legacy_kernel != nullptr);
         }
 
+        const bool legacy_r8_cols1_shape_ok =
+            backend_ctx->legacy_q4_0_mul_mat_cols1 &&
+            row_tile == 8 &&
+            ne11 == 1 &&
+            ne01 % 8 == 0 &&
+            nb_q4 <= (int) base_local_size &&
+            nb10 == sizeof(float) &&
+            nb0 == sizeof(float);
+        const bool use_legacy_r8_cols1_warp_pack_k1024 =
+            backend_ctx->legacy_q4_0_mul_mat_warp_pack &&
+            legacy_r8_cols1_shape_ok &&
+            backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp != nullptr &&
+            ne00 == 1024 &&
+            ne01 % 32 == 0 &&
+            base_local_size == 32 &&
+            backend_ctx->max_workgroup_size >= 128;
+        const bool use_legacy_r8_cols1_warp_pack_k3072 =
+            backend_ctx->legacy_q4_0_mul_mat_warp_pack &&
+            legacy_r8_cols1_shape_ok &&
+            backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2 != nullptr &&
+            ne00 == 3072 &&
+            ne01 % 16 == 0 &&
+            base_local_size == 128 &&
+            backend_ctx->max_workgroup_size >= 192;
+        const bool use_legacy_r8_cols1_warp_pack =
+            use_legacy_r8_cols1_warp_pack_k1024 ||
+            use_legacy_r8_cols1_warp_pack_k3072;
+        const bool use_legacy_r8_cols1 =
+            legacy_r8_cols1_shape_ok &&
+            backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1 != nullptr &&
+            !use_legacy_r8_cols1_warp_pack;
+        if (use_legacy_r8_cols1_warp_pack_k1024) {
+            legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp;
+            local_size = 128;
+        }
+        if (use_legacy_r8_cols1_warp_pack_k3072) {
+            legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1wp2;
+            local_size = 192;
+        }
+        if (use_legacy_r8_cols1) {
+            legacy_kernel = backend_ctx->kernel_legacy_mul_mat_q4_0_f32_r8c1;
+        }
+
         char profile_kernel_name[128];
-        snprintf(
-            profile_kernel_name,
-            sizeof(profile_kernel_name),
-            "ggml_legacy_mul_mat_q4_0_f32_r%d_lws%zu_k%d_rows%d_cols%d",
-            row_tile,
-            local_size,
-            ne00,
-            ne01,
-            ne11);
+        if (use_legacy_r8_cols1_warp_pack_k1024) {
+            snprintf(
+                profile_kernel_name,
+                sizeof(profile_kernel_name),
+                "ggml_legacy_mul_mat_q4_0_f32_r8c1wp4_lws%zu_k%d_rows%d_cols%d",
+                local_size,
+                ne00,
+                ne01,
+                ne11);
+        } else if (use_legacy_r8_cols1_warp_pack_k3072) {
+            snprintf(
+                profile_kernel_name,
+                sizeof(profile_kernel_name),
+                "ggml_legacy_mul_mat_q4_0_f32_r8c1wp2_lws%zu_k%d_rows%d_cols%d",
+                local_size,
+                ne00,
+                ne01,
+                ne11);
+        } else if (use_legacy_r8_cols1) {
+            snprintf(
+                profile_kernel_name,
+                sizeof(profile_kernel_name),
+                "ggml_legacy_mul_mat_q4_0_f32_r8c1_lws%zu_k%d_rows%d_cols%d",
+                local_size,
+                ne00,
+                ne01,
+                ne11);
+        } else {
+            snprintf(
+                profile_kernel_name,
+                sizeof(profile_kernel_name),
+                "ggml_legacy_mul_mat_q4_0_f32_r%d_lws%zu_k%d_rows%d_cols%d",
+                row_tile,
+                local_size,
+                ne00,
+                ne01,
+                ne11);
+        }
 
         CL_CHECK(clSetKernelArg(legacy_kernel,  0, sizeof(cl_mem),   &extra0->data_device));
         CL_CHECK(clSetKernelArg(legacy_kernel,  1, sizeof(cl_ulong), &offset0));
@@ -14684,7 +15373,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         CL_CHECK(clSetKernelArg(legacy_kernel, 25, sizeof(cl_ulong), &nb2));
         CL_CHECK(clSetKernelArg(legacy_kernel, 26, sizeof(cl_ulong), &nb3));
 
-        const size_t row_groups = ((size_t) ne01 + (size_t) row_tile - 1) / (size_t) row_tile;
+        size_t row_groups = ((size_t) ne01 + (size_t) row_tile - 1) / (size_t) row_tile;
+        if (use_legacy_r8_cols1_warp_pack_k1024) {
+            row_groups /= 4;
+        } else if (use_legacy_r8_cols1_warp_pack_k3072) {
+            row_groups /= 2;
+        }
         size_t global_work_size[] = { row_groups * local_size, (size_t)ne11, (size_t)ne12 * ne13 };
         size_t local_work_size[] = {local_size, 1, 1};
 
